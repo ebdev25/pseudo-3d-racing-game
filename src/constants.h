@@ -37,10 +37,31 @@ typedef struct {
     int x, y, w, h;
 } Sprite;
 
-// Background layer structure
+// Offset structure
+typedef struct {
+    int x,y;
+} Offset;
+
+// LOD region structure
 typedef struct {
     int x, y, w, h;
+} LODRegion;
+
+typedef struct {
+    SDL_Rect highLOD;
+    SDL_Rect midLOD;
+    SDL_Rect lowLOD;
 } BackgroundLayer;
+
+typedef struct {
+    const SDL_Rect* L2; // Low LOD
+    const Offset* L2Offset; // Unique offst for the texture in Layer 2
+    const SDL_Rect* L3; // Mid LOD
+    const Offset* L3Offset; // Unique offst for the texture in Layer 3
+    const SDL_Rect* L4; // High LOD
+    const Offset* L4Offset; // Unique offst for the texture in Layer 4
+} BackgroundCycleState;
+
 
 #define FPS 60
 #define STEP (1.0 / FPS)
@@ -55,7 +76,6 @@ typedef struct {
 #define DRAW_DISTANCE 300
 #define FOG_DENSITY 5
 //#define M_PI 3.14159265359
-#define MAX_BACKGROUND_SEGMENTS 3
 
 #define MAX_SPEED (SEGMENT_LENGTH / STEP)
 #define ACCELERATION (MAX_SPEED / 5)
@@ -80,9 +100,6 @@ typedef struct {
 extern const Color COLOR_SKY;
 extern const Color COLOR_TREE;
 extern const Color COLOR_FOG;
-extern const Color COLOR_RED;
-extern const Color COLOR_GREEN;
-extern const Color COLOR_BLUE;
 
 // Color schemes
 extern const ColorScheme COLOR_LIGHT;
@@ -94,6 +111,10 @@ extern const ColorScheme COLOR_FINISH;
 extern const BackgroundLayer BACKGROUND_HILLS;
 extern const BackgroundLayer BACKGROUND_SKY;
 extern const BackgroundLayer BACKGROUND_TREES;
+extern const BackgroundLayer BACKGROUND_HOUSES;
+
+// Cycle states for LOD cycling
+extern const BackgroundCycleState BACKGROUND_CYCLE_STATES[3];
 
 // Sprite constants
 extern const Sprite SPRITE_PALM_TREE;
