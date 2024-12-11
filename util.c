@@ -80,3 +80,148 @@ void project(Point* p, double cameraX, double cameraY, double cameraZ, double ca
 double percentRemaining(double n, double total) {
     return fmod(n, total) / total;
 }
+
+// Checks if two objects overlap based on their positions and widths.
+int overlap(double x1, double w1, double x2, double w2, double percent) {
+    // Calculate half of the combined widths, scaled by the overlap threshold percentage.
+    double half = (w1 + w2) * (percent / 2.0);
+
+    // Check if the distance between x1 and x2 is less than the calculated half width.
+    // If true, it means the objects are within the overlap threshold.
+    return fabs(x1 - x2) < half;
+}
+
+float lerp_float(float a, float b, float t) {
+    return a + t * (b - a);
+}
+
+SDL_Surface* blend_surface_with_color(SDL_Surface* surface, SDL_Color blendColor, float blendFactor) {
+    if (!surface) {
+        fprintf(stderr, "blend_surface_with_color: Received NULL surface.\n");
+        return NULL;
+    }
+
+    // Ensure blendFactor is within [0.0, 1.0]
+    blendFactor = fmaxf(0.0f, fminf(blendFactor, 1.0f));
+
+    // Convert surface to RGBA8888 format for consistent pixel manipulation
+    SDL_Surface* convertedSurface = SDL_ConvertSurfaceFormat(surface, SDL_PIXELFORMAT_RGBA8888, 0);
+    if (!convertedSurface) {
+        fprintf(stderr, "blend_surface_with_color: SDL_ConvertSurfaceFormat failed: %s\n", SDL_GetError());
+        return NULL;
+    }
+
+    // Create a new surface to store the blended result
+    SDL_Surface* blendedSurface = SDL_CreateRGBSurfaceWithFormat(0, convertedSurface->w, convertedSurface->h,
+                                                                 32, SDL_PIXELFORMAT_RGBA8888);
+    if (!blendedSurface) {
+        fprintf(stderr, "blend_surface_with_color: SDL_CreateRGBSurfaceWithFormat failed: %s\n", SDL_GetError());
+        SDL_FreeSurface(convertedSurface);
+        return NULL;
+    }
+
+    // Lock both surfaces for direct pixel access
+    if (SDL_MUSTLOCK(convertedSurface)) {
+        if (SDL_LockSurface(convertedSurface) != 0) {
+            fprintf(stderr, "blend_surface_with_color: SDL_LockSurface failed: %s\n", SDL_GetError());
+            SDL_FreeSurface(convertedSurface);
+            SDL_FreeSurface(blendedSurface);
+            return NULL;
+        }
+    }
+    if (SDL_MUSTLOCK(blendedSurface)) {
+        if (SDL_LockSurface(blendedSurface) != 0) {
+            fprintf(stderr, "blend_surface_with_color: SDL_LockSurface failed: %s\n", SDL_GetError());
+            if (SDL_MUSTLOCK(convertedSurface)) SDL_UnlockSurface(convertedSurface);
+            SDL_FreeSurface(convertedSurface);
+            SDL_FreeSurface(blendedSurface);
+            return NULL;
+        }
+    }
+
+    // Iterate over each pixel and apply blending
+    Uint32* srcPixels = (Uint32*)convertedSurface->pixels;
+    Uint32* dstPixels = (Uint32*)blendedSurface->pixels;
+    int totalPixels = convertedSurface->w * convertedSurface->h;
+
+    for (int i = 0; i < totalPixels; ++i) {
+        Uint32 pixel = srcPixels[i];
+        Uint8 r, g, b, a;
+        SDL_GetRGBA(pixel, convertedSurface->format, &r, &g, &b, &a);
+
+        // Apply blending: blended = original * (1 - blendFactor) + blendColor * blendFactor
+        Uint8 blendedR = (Uint8)(r * (1.0f - blendFactor) + blendColor.r * blendFactor);
+        Uint8 blendedG = (Uint8)(g * (1.0f - blendFactor) + blendColor.g * blendFactor);
+        Uint8 blendedB = (Uint8)(b * (1.0f - blendFactor) + blendColor.b * blendFactor);
+        Uint8 blendedA = a; // Preserve original alpha
+
+        dstPixels[i] = SDL_MapRGBA(blendedSurface->format, blendedR, blendedG, blendedB, blendedA);
+    }
+
+    // Unlock surfaces if they were locked
+    if (SDL_MUSTLOCK(convertedSurface)) {
+        SDL_UnlockSurface(convertedSurface);
+    }
+    if (SDL_MUSTLOCK(blendedSurface)) {
+        SDL_UnlockSurface(blendedSurface);
+    }
+
+    // Free the converted surface as it's no longer needed
+    SDL_FreeSurface(convertedSurface);
+
+    return blendedSurface;
+}
+
+SDL_Texture* create_blended_texture(SDL_Renderer* renderer, SDL_Surface* sourceSurface, SDL_Rect srcRect, SDL_Color blendColor, float blendFactor) {
+    if (!sourceSurface) {
+        fprintf(stderr, "create_blended_texture: Received NULL sourceSurface.\n");
+        return NULL;
+    }
+
+    // Ensure srcRect is within the bounds of the sourceSurface
+    if (srcRect.x < 0 || srcRect.y < 0 ||
+        srcRect.x + srcRect.w > sourceSurface->w ||
+        srcRect.y + srcRect.h > sourceSurface->h) {
+        fprintf(stderr, "create_blended_texture: srcRect is out of bounds.\n");
+        return NULL;
+    }
+
+    // Create a new surface to hold the extracted area
+    SDL_Surface* subSurface = SDL_CreateRGBSurfaceWithFormat(0, srcRect.w, srcRect.h,
+                                                             sourceSurface->format->BitsPerPixel,
+                                                             sourceSurface->format->format);
+    if (!subSurface) {
+        fprintf(stderr, "create_blended_texture: SDL_CreateRGBSurfaceWithFormat failed: %s\n", SDL_GetError());
+        return NULL;
+    }
+
+    // Blit the relevant area from the source surface to the sub-surface
+    if (SDL_BlitSurface(sourceSurface, &srcRect, subSurface, NULL) != 0) {
+        fprintf(stderr, "create_blended_texture: SDL_BlitSurface failed: %s\n", SDL_GetError());
+        SDL_FreeSurface(subSurface);
+        return NULL;
+    }
+
+    // Apply color blending to the sub-surface
+    SDL_Surface* blendedSurface = blend_surface_with_color(subSurface, blendColor, blendFactor);
+    if (!blendedSurface) {
+        fprintf(stderr, "create_blended_texture: blend_surface_with_color failed.\n");
+        SDL_FreeSurface(subSurface);
+        return NULL;
+    }
+
+    // Create a texture from the blended surface
+    SDL_Texture* blendedTexture = SDL_CreateTextureFromSurface(renderer, blendedSurface);
+    if (!blendedTexture) {
+        fprintf(stderr, "create_blended_texture: SDL_CreateTextureFromSurface failed: %s\n", SDL_GetError());
+        SDL_FreeSurface(blendedSurface);
+        SDL_FreeSurface(subSurface);
+        return NULL;
+    }
+
+    // Free temporary surfaces as they are no longer needed
+    SDL_FreeSurface(blendedSurface);
+    SDL_FreeSurface(subSurface);
+
+    return blendedTexture;
+}
