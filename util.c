@@ -80,3 +80,17 @@ void project(Point* p, double cameraX, double cameraY, double cameraZ, double ca
 double percentRemaining(double n, double total) {
     return fmod(n, total) / total;
 }
+
+// Checks if two objects overlap based on their positions and widths.
+int overlap(double x1, double w1, double x2, double w2, double percent) {
+    // Calculate half of the combined widths, scaled by the overlap threshold percentage.
+    double half = (w1 + w2) * (percent / 2.0);
+
+    // Check if the distance between x1 and x2 is less than the calculated half width.
+    // If true, it means the objects are within the overlap threshold.
+    return fabs(x1 - x2) < half;
+}
+
+float lerp_float(float a, float b, float t) {
+    return a + t * (b - a);
+}

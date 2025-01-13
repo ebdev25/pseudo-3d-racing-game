@@ -15,5 +15,6 @@ double exponentialFog(double distance, double density);
 double increase(double start, double increment, double max);
 void project(Point* p, double cameraX, double cameraY, double cameraZ, double cameraDepth, int width, int height, double roadWidth);
 double percentRemaining(double n, double total);
-
+int overlap(double x1, double w1, double x2, double w2, double percent);
+float lerp_float(float a, float b, float t);
 #endif // UTIL_H

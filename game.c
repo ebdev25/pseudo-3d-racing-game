@@ -1,35 +1,51 @@
 // game.c
 #include "game.h"
+#include "background_game.h"
+#include "background.h"
 #include "util.h"
 #include "render.h"
 #include "constants.h"
+#include "level_loader.h"
+
 #include <SDL2/SDL_image.h>
 #include <SDL2/SDL_ttf.h>
+#include <SDL2/SDL_mixer.h>
 #include <stdlib.h>
 #include <math.h>
 #include <time.h>
+#include <stdio.h>
 
 // Forward declarations
 void updateCars(Game* game, double dt, Segment* playerSegment, double playerW);
 double updateCarOffset(Game* game, Car* car, Segment* carSegment, Segment* playerSegment, double playerW);
-int overlap(double x1, double w1, double x2, double w2, double percent);
 
+// Initialize the game
 void initGame(Game* game, SDL_Renderer* renderer) {
     // Initialize SDL_ttf for text rendering in the HUD
-    TTF_Init();
+    if (TTF_Init() == -1) {
+        SDL_Log("TTF_Init Error: %s", TTF_GetError());
+        exit(1);
+    }
+
+    // Initialize SDL_mixer for audio
+    if (Mix_OpenAudio(44100, MIX_DEFAULT_FORMAT, 2, 2048) < 0) {
+        SDL_Log("Mix_OpenAudio Error: %s", Mix_GetError());
+        TTF_Quit();
+        exit(1);
+    }
 
     // Set up renderer and screen dimensions
     game->renderer = renderer;
-    game->width = WIDTH;               // Screen width
-    game->height = HEIGHT;             // Screen height
+    game->width = WIDTH;  // Screen width
+    game->height = HEIGHT; // Screen height
     game->resolution = (double)game->height / 480.0;  // Scaling factor based on screen height
 
     // Initialize player and camera state
-    game->position = 0;                // Current position along the track
-    game->speed = 0;                   // Initial speed of the player
-    game->playerX = 0;                 // Horizontal offset of the player from the road center
-    game->playerZ = CAMERA_HEIGHT * (1 / tan((FIELD_OF_VIEW / 2.0) * M_PI / 180.0));  // Distance from camera to player
-    game->cameraDepth = 1 / tan((FIELD_OF_VIEW / 2.0) * M_PI / 180.0);  // Depth of camera view
+    game->position = 0.0;  // Current position along the track
+    game->speed = 0.0;     // Initial speed of the player
+    game->playerX = 0.0;   // Horizontal offset of the player from the road center
+    game->playerZ = CAMERA_HEIGHT * (1.0 / tan((FIELD_OF_VIEW / 2.0) * M_PI / 180.0));  // Distance from camera to player
+    game->cameraDepth = 1.0 / tan((FIELD_OF_VIEW / 2.0) * M_PI / 180.0);  // Depth of camera view
 
     // Initialize input key states (0 means not pressed)
     game->keyLeft = 0;
@@ -37,221 +53,133 @@ void initGame(Game* game, SDL_Renderer* renderer) {
     game->keyAccelerate = 0;
     game->keyBrake = 0;
 
-    // Load background texture
-    game->background = IMG_LoadTexture(renderer, "../resources/background_v7.png");
-    if (!game->background) {
-        SDL_Log("Failed to load background texture: %s", SDL_GetError());
-        exit(1);
-    }
-
-    // Load spritesheet texture for in-game objects and cars
-    game->spritesheet = IMG_LoadTexture(renderer, "../resources/sprites_v2.png");
-    if (!game->spritesheet) {
-        SDL_Log("Failed to load spritesheet texture: %s", SDL_GetError());
-        exit(1);
-    }
-
-    // Load background music
-    game->music = Mix_LoadMUS("../resources/music/racer.mp3");
-    if (!game->music) {
-        SDL_Log("Failed to load background music: %s", Mix_GetError());
-        exit(1);
-    }
-
-    // Start playing background music in a loop
-    if (Mix_PlayMusic(game->music, -1) == -1) {
-        SDL_Log("Failed to play music: %s", Mix_GetError());
-        exit(1);
-    }
-
     // Initialize road and track parameters
-    game->road.segments = NULL;        // Array of track segments
-    game->road.segmentCount = 0;       // Number of segments on the track
-    game->road.trackLength = 0;        // Total length of the track
-    game->road.cars = NULL;            // Array of cars on the track
-    game->road.carCount = 0;           // Number of cars
+    memset(&game->road, 0, sizeof(Road));  // Clear road struct
 
     // Set various track properties
     game->rumbleLength = RUMBLE_LENGTH;  // Length of alternating rumble strip colors
     game->totalCars = 200;               // Total number of cars on the track
     game->maxSpeed = MAX_SPEED;          // Maximum player speed
-    game->accel = game->maxSpeed / 5;    // Acceleration rate
+    game->accel = game->maxSpeed / 5.0;  // Acceleration rate
     game->breaking = -game->maxSpeed;    // Deceleration (braking) rate
-    game->decel = -game->maxSpeed / 5;   // Natural deceleration when not accelerating
-    game->offRoadDecel = -game->maxSpeed / 2;  // Deceleration when off-road
-    game->offRoadLimit = game->maxSpeed / 4;   // Speed limit when off-road
-    game->centrifugal = 0.3;              // Centrifugal force for turning
-
-    // Initialize background phase and transition variables
-    game->backgroundPhase = 1;        // Start with the middle cycle state
-    game->nextBackgroundPhase = 1;    // Initialize to the same as current
-    game->lodCycleThreshold = game->road.trackLength / 3;  // Divide track into three sections
-
-    // Initialize offsets and speeds for background layers
-    game->skyOffset = 0.0;
-    game->hillOffset = 0.0;
-    game->treeOffset = 0.0;
-    game->housesOffset = 0.0;
-
-    game->skySpeed = 0.001;
-    game->hillSpeed = 0.002;
-    game->treeSpeed = 0.003;
-    game->housesSpeed = 0.004;
-
-    // Initialize transition variables
-    game->isTransitioning = false;
-    game->transitionProgress = 0.0;
-    game->transitionSpeed = 0.85;  // desired speed
-
-    // Initialize parallax scrolling flag
-    game->parallaxEnabled = true;
-
-    // Initialize fixed parallax offsets
-    game->fixedHillOffset = 0.0;
-    game->fixedTreeOffset = 0.0;
-    game->fixedHousesOffset = 0.0;
-
-    // Background fog settings
-    game->fogEnabled = false; // Initially Off
-    game->fogIntensity = 0.0; // No fog initially
-    game->fogTransitionSpeed = 1.0;
-    game->fogColor = (SDL_Color){135,206,235,255};
+    game->decel = -game->maxSpeed / 5.0; // Natural deceleration when not accelerating
+    game->offRoadDecel = -game->maxSpeed / 2.0;  // Deceleration when off-road
+    game->offRoadLimit = game->maxSpeed / 4.0;   // Speed limit when off-road
+    game->centrifugal = 0.3;  // Centrifugal force for turning
 
     // Camera and drawing settings
-    game->lanes = LANE_COUNT;            // Number of lanes on the road
-    game->drawDistance = DRAW_DISTANCE;  // Number of segments to draw ahead of the player
-    game->fogDensity = FOG_DENSITY;      // Density of fog effect for distant segments
+    game->lanes = LANE_COUNT;              // Number of lanes on the road
+    game->drawDistance = DRAW_DISTANCE;    // Number of segments to draw ahead of the player
+    game->fogDensity = FOG_DENSITY;        // Density of fog effect for distant segments
 
     // Initialize lap timing variables
-    game->currentLapTime = 0;            // Time for the current lap
-    game->lastLapTime = 0;               // Time for the previous lap
-
-    // Initialize HUD (if implemented later)
-    // TO BE ADDED
+    game->currentLapTime = 0.0;  // Time for the current lap
+    game->lastLapTime = 0.0;     // Time for the previous lap
 
     // Seed the random number generator for randomized elements
     srand((unsigned int)time(NULL));
 
-    // Build the initial road layout
+    // Sliding Window init to NULL
+    game->slidingWindow = NULL;
+
+    // Load the level and associated resources
+    if (!loadLevel(game, "/home/horatiobelter/Desktop/Programming/Pseudo 3D Racer/levels/desert_level.json")) {
+        SDL_Log("Failed to load level.\n");
+        Mix_CloseAudio();
+        TTF_Quit();
+        exit(1);
+    }
+
+    // Reset road segments
     resetRoad(game);
+
+    // Initialize additional game state variables
+    game->lodCycleThreshold = (game->road.trackLength > 0.0) ? (game->road.trackLength / 3.0) : 1000.0;
+    game->horizonY = 0.0;
+    game->colorProgress = 0.0f;
+
+    if (game->slidingWindow && game->slidingWindow->cycleStateCount > 0) {
+        for (int i = 0; i < 3; i++) {
+            game->storedOffsets[i] = game->slidingWindow->cycleStates[0].offsets[i].x;
+            game->storedOffsetsY[i] = game->slidingWindow->cycleStates[0].offsets[i].y;
+        }
+    } else {
+        memset(game->storedOffsets, 0, sizeof(game->storedOffsets));
+        memset(game->storedOffsetsY, 0, sizeof(game->storedOffsetsY));
+    }
+
+    game->transitionElapsed = 0;
+    game->transitionHappening = 0;
 }
 
 void handleEvent(Game* game, SDL_Event* event) {
     if (event->type == SDL_KEYDOWN) {
         switch (event->key.keysym.sym) {
-            case SDLK_LEFT:
-            case SDLK_a:
+            case KEY_LEFT:
+            case KEY_A:
                 game->keyLeft = 1;
                 break;
-            case SDLK_RIGHT:
-            case SDLK_d:
+            case KEY_RIGHT:
+            case KEY_D:
                 game->keyRight = 1;
                 break;
-            case SDLK_UP:
-            case SDLK_w:
+            case KEY_UP:
+            case KEY_W:
                 game->keyAccelerate = 1;
                 break;
-            case SDLK_DOWN:
-            case SDLK_s:
+            case KEY_DOWN:
+            case KEY_S:
                 game->keyBrake = 1;
+                break;
+            default:
                 break;
         }
     } else if (event->type == SDL_KEYUP) {
         switch (event->key.keysym.sym) {
-            case SDLK_LEFT:
-            case SDLK_a:
+            case KEY_LEFT:
+            case KEY_A:
                 game->keyLeft = 0;
                 break;
-            case SDLK_RIGHT:
-            case SDLK_d:
+            case KEY_RIGHT:
+            case KEY_D:
                 game->keyRight = 0;
                 break;
-            case SDLK_UP:
-            case SDLK_w:
+            case KEY_UP:
+            case KEY_W:
                 game->keyAccelerate = 0;
                 break;
-            case SDLK_DOWN:
-            case SDLK_s:
+            case KEY_DOWN:
+            case KEY_S:
                 game->keyBrake = 0;
+                break;
+            default:
                 break;
         }
     }
 }
 
+// Update the game state
 void updateGame(Game* game, double dt) {
-    // Calculate player width for collision detection
+    // Handle main game logic
     double playerW = SPRITE_PLAYER_STRAIGHT.w * SPRITE_SCALE;
 
     // Percentage of the maximum speed that the player is currently moving
-    double speedPercent = game->speed / game->maxSpeed;
+    double speedPercent = (game->maxSpeed > 0.0) ? (game->speed / game->maxSpeed) : 0.0; // Avoid division by zero
 
     // Horizontal movement increment based on time step and speed
-    double dx = dt * 2 * speedPercent;
+    double dx = dt * 2.0 * speedPercent;
 
     // Store the starting position to calculate distance moved
     double startPosition = game->position;
 
-    // Determine the current phase based on player's position
-    int currentPhase = (int)(game->position / game->lodCycleThreshold) % 3;
-
-    // Check if we need to start a transition
-    if (currentPhase != game->backgroundPhase && !game->isTransitioning) {
-        game->isTransitioning = true;
-        game->transitionProgress = 0.0;
-        game->nextBackgroundPhase = currentPhase;
-
-        // Disable parallax scrolling for individual cycle state backgrounds during transitions
-        game->parallaxEnabled = false;
-
-        // Store current parallax offsets
-        game->fixedHillOffset = game->hillOffset;
-        game->fixedTreeOffset = game->treeOffset;
-        game->fixedHousesOffset = game->housesOffset;
-
-        // Enable fog at the start of the transition
-        game->fogEnabled = true;
-        game->fogIntensity = 0.0;  // Start with no fog
-    }
-
-    // Update transition progress if a transition is in progress
-    if (game->isTransitioning) {
-        // Increment transition progress
-        game->transitionProgress += game->transitionSpeed * dt;
-
-        // Increment fog intensity
-        if (game->fogIntensity < 1.0) {
-            game->fogIntensity += game->fogTransitionSpeed * dt;
-            if (game->fogIntensity > 1.0) {
-                game->fogIntensity = 1.0;  // Cap fog intensity
-            }
-        }
-
-        // Check if the transition is complete
-        if (game->transitionProgress >= 1.0) {
-            game->transitionProgress = 0.0;
-            game->backgroundPhase = game->nextBackgroundPhase;
-            game->isTransitioning = false;
-
-            // Re-enable individual parallax scrolling after the transition is complete
-            game->parallaxEnabled = true;
-        }
-    }
-
-    // Handle fog fade-out after the transition is complete
-    if (!game->isTransitioning && game->fogEnabled) {
-        game->fogIntensity -= game->fogTransitionSpeed * dt;
-        if (game->fogIntensity <= 0.0) {
-            game->fogIntensity = 0.0;
-            game->fogEnabled = false;  // Disable fog once it has fully faded out
-        }
-    }
-
-
-    // Update the background layers' scrolling offsets based on road curvature
+    // Find the current player segment
     Segment* playerSegment = findSegment(game, game->position + game->playerZ);
-    //double curve = playerSegment->curve;
+    if (playerSegment == NULL) {
+        SDL_Log("Error: Player segment not found in updateGame.\n");
+        return;
+    }
 
-    // Update the AI cars on the track
+    // Update cars on the track
     updateCars(game, dt, playerSegment, playerW);
 
     // Move the player's position forward based on current speed
@@ -260,7 +188,7 @@ void updateGame(Game* game, double dt) {
     // Handle player input for left/right movement
     if (game->keyLeft)
         game->playerX -= dx;
-    else if (game->keyRight)
+    if (game->keyRight)
         game->playerX += dx;
 
     // Adjust position based on the road's curve and centrifugal force
@@ -275,7 +203,7 @@ void updateGame(Game* game, double dt) {
         game->speed = accelerate(game->speed, game->decel, dt);
 
     // Handle player going off-road
-    if ((game->playerX < -1) || (game->playerX > 1)) {
+    if ((game->playerX < -1.0) || (game->playerX > 1.0)) {
         // Slow down player if off-road
         if (game->speed > game->offRoadLimit)
             game->speed = accelerate(game->speed, game->offRoadDecel, dt);
@@ -284,10 +212,12 @@ void updateGame(Game* game, double dt) {
         for (int n = 0; n < playerSegment->spriteCount; n++) {
             SpriteInstance* sprite = &playerSegment->sprites[n];
             double spriteW = sprite->source->w * SPRITE_SCALE;
-            // If collision detected, slow down player and reset position slightly
-            if (overlap(game->playerX, playerW, sprite->offset + spriteW / 2 * (sprite->offset > 0 ? 1 : -1), spriteW, 1.0)) {
-                game->speed = game->maxSpeed / 5;
+            double spriteCenterOffset = sprite->offset + ((sprite->offset > 0.0) ? (spriteW / 2.0) : (-spriteW / 2.0));
+
+            if (overlap(game->playerX, playerW, spriteCenterOffset, spriteW, 1.0)) {
+                game->speed = game->maxSpeed / 5.0;
                 game->position = increase(playerSegment->p1.world.z, -game->playerZ, game->road.trackLength);
+                SDL_Log("Collision with roadside sprite detected. Speed reduced and position reset.\n");
                 break;
             }
         }
@@ -297,46 +227,86 @@ void updateGame(Game* game, double dt) {
     for (int n = 0; n < playerSegment->carCount; n++) {
         Car* car = playerSegment->cars[n];
         double carW = car->sprite->w * SPRITE_SCALE;
+
         if (game->speed > car->speed) {
-            // If a collision is detected, reduce player speed and reset position
             if (overlap(game->playerX, playerW, car->offset, carW, 0.8)) {
-                game->speed = car->speed * (car->speed / game->speed);
+                game->speed = (game->speed > 0.0) ? (car->speed * (car->speed / game->speed)) : 0.0;
                 game->position = increase(car->z, -game->playerZ, game->road.trackLength);
+                SDL_Log("Collision with car detected. Speed adjusted and position reset.\n");
                 break;
             }
         }
     }
 
     // Limit the player’s horizontal position and speed
-    game->playerX = limit(game->playerX, -3, 3);
-    game->speed = limit(game->speed, 0, game->maxSpeed);
+    game->playerX = limit(game->playerX, -3.0, 3.0);
+    game->speed = limit(game->speed, 0.0, game->maxSpeed);
 
-    // Find the player's updated segment after position change
-    //Segment* playerSeg = findSegment(game, game->position);
-
-    // Update the background layers' scrolling offsets based on road curvature
-    game->skyOffset = increase(game->skyOffset, game->skySpeed * playerSegment->curve * (game->position - startPosition) / SEGMENT_LENGTH, 1);
-    game->hillOffset = increase(game->hillOffset, game->hillSpeed * playerSegment->curve * (game->position - startPosition) / SEGMENT_LENGTH, 1);
-    game->treeOffset = increase(game->treeOffset, game->treeSpeed * playerSegment->curve * (game->position - startPosition) / SEGMENT_LENGTH, 1);
-    game->housesOffset = increase(game->housesOffset, game->housesSpeed * playerSegment->curve * (game->position - startPosition) / SEGMENT_LENGTH, 1);
-
-    // Update the lap timer based on player position
+    // Update lap timing variables
     if (game->position > game->playerZ) {
-        // If crossing the start line, reset lap time and save last lap time
-        if (game->currentLapTime > 0 && startPosition < game->playerZ) {
+        if (game->currentLapTime > 0.0 && (startPosition < game->playerZ)) {
             game->lastLapTime = game->currentLapTime;
-            game->currentLapTime = 0;
-            // TODO: HUD updates for lap times can be added here
+            game->currentLapTime = 0.0;
+            SDL_Log("Lap completed. Last lap time: %.2f seconds\n", game->lastLapTime);
+            // Reset lodCycleThreshold to the start of the new lap
+            game->lodCycleThreshold -= game->road.trackLength;
+            if (game->lodCycleThreshold < 0.0) {
+                game->lodCycleThreshold += game->road.trackLength;
+            }
         } else {
-            // Increment lap timer if not crossing the start line
             game->currentLapTime += dt;
         }
     }
 
-    // Update HUD elements
-    // TODO: Add HUD update code here
+    // Calculate projected horizon y value
+    game->horizonY = calculateHorizonY(game);
+
+    // Update the background sliding window
+    updateBackgroundSlidingWindow(game, game->slidingWindow, dt, game->speed, playerSegment->curve);
+
+    if (game->transitionElapsed && !game->slidingWindow->transitioning) {
+        // Reset flag to prevent it from being updated every frame
+        game->transitionElapsed = 0;
+    }
+
+    // Update parallax for the current background cycle state
+    double elevation = calculateElevation(playerSegment, game->position);
+    updateParallax(game->currentCycleState, game->speed, playerSegment->curve, elevation, game->position, game->position - (game->speed * dt), dt, game->horizonY);
+
+    // Handle background transitions
+    if (game->slidingWindow->transitioning && game->targetCycleState) {
+        updateLayerTransitions(game, game->currentCycleState, game->targetCycleState, dt, game->speed, playerSegment->curve);
+        updateTransitionColors(game->slidingWindow, dt);
+    }
+    // Automatically advance to the next background state if threshold is reached
+    if (!game->slidingWindow->transitioning && game->position > game->lodCycleThreshold) {
+        advanceToNextState(game, game->slidingWindow);
+        game->currentCycleState = &game->slidingWindow->cycleStates[game->slidingWindow->currentCycleStateIndex];
+        game->lodCycleThreshold += (game->road.trackLength / 3.0);
+        if (game->lodCycleThreshold > game->road.trackLength) {
+            game->lodCycleThreshold -= game->road.trackLength;
+        }
+    }
+
+    if (game->slidingWindow->transitioning && game->targetCycleState) {
+        double elevation2 = calculateElevation(playerSegment, game->position);
+        updateParallax(game->targetCycleState, 
+                   game->speed, 
+                   playerSegment->curve,
+                   elevation2,
+                   game->position,
+                   game->position - (game->speed * dt),
+                   dt,
+                   game->horizonY);
+    }
+
+    if (!game->slidingWindow->transitioning) {
+        game->currentCycleState = &game->slidingWindow->cycleStates[game->slidingWindow->currentCycleStateIndex];
+    }    
+    // Update HUD elements (TODO)
 }
 
+// Render the game
 void renderGame(Game* game) {
     // Call the render function
     render(game);
@@ -345,34 +315,45 @@ void renderGame(Game* game) {
     // TO BE ADDED
 }
 
+// Clean up game resources
 void cleanupGame(Game* game) {
     // Free resources
     if (game->background)
         SDL_DestroyTexture(game->background);
     if (game->spritesheet)
         SDL_DestroyTexture(game->spritesheet);
-
     // Free road segments
-    for (int i = 0; i < game->road.segmentCount; i++) {
-        Segment* segment = &game->road.segments[i];
-        if (segment->sprites)
-            free(segment->sprites);
-        if (segment->cars)
-            free(segment->cars);
+    if (game->road.segments) {
+        for (int i = 0; i < game->road.segmentCount; i++) {
+            Segment* segment = &game->road.segments[i];
+            if (segment->sprites)
+                free(segment->sprites);
+            if (segment->cars)
+                free(segment->cars);
+        }
+        free(game->road.segments);
     }
-    free(game->road.segments);
 
     // Free cars
-    free(game->road.cars);
+    if (game->road.cars)
+        free(game->road.cars);
+
+    // Free SlidingWindow
+    if (game->slidingWindow) {
+        free(game->slidingWindow);
+        game->slidingWindow = NULL;
+    }
 
     // Free music
     if (game->music)
         Mix_FreeMusic(game->music);
 
-    // Quit SDL_ttf
+    // Quit SDL_ttf and SDL_mixer
     TTF_Quit();
+    Mix_CloseAudio();
 }
 
+// Update AI cars on the track
 void updateCars(Game* game, double dt, Segment* playerSegment, double playerW) {
     // Loop through each car on the road
     for (int n = 0; n < game->road.carCount; n++) {
@@ -380,6 +361,10 @@ void updateCars(Game* game, double dt, Segment* playerSegment, double playerW) {
 
         // Find the segment the car is currently in
         Segment* oldSegment = findSegment(game, car->z);
+        if (oldSegment == NULL) {
+            SDL_Log("Error: Car's current segment not found.\n");
+            continue;
+        }
 
         // Adjust the car's lateral position based on player position and obstacles
         double offset = updateCarOffset(game, car, oldSegment, playerSegment, playerW);
@@ -393,10 +378,15 @@ void updateCars(Game* game, double dt, Segment* playerSegment, double playerW) {
 
         // Find the segment the car has moved into
         Segment* newSegment = findSegment(game, car->z);
+        if (newSegment == NULL) {
+            SDL_Log("Error: Car's new segment not found.\n");
+            continue;
+        }
 
         // Check if the car has moved to a different segment
         if (oldSegment != newSegment) {
             // Remove car from the old segment's car list
+            bool found = false;
             for (int i = 0; i < oldSegment->carCount; i++) {
                 if (oldSegment->cars[i] == car) {
                     // Shift remaining cars to fill the gap
@@ -404,25 +394,35 @@ void updateCars(Game* game, double dt, Segment* playerSegment, double playerW) {
                         oldSegment->cars[j] = oldSegment->cars[j + 1];
                     }
                     oldSegment->carCount--;
+                    found = true;
                     break;
                 }
             }
+            if (!found) {
+                SDL_Log("Warning: Car not found in old segment's car list.\n");
+            }
 
             // Add car to the new segment's car list
-            newSegment->cars = realloc(newSegment->cars, sizeof(Car*) * (newSegment->carCount + 1));
+            Car** resizedCars = realloc(newSegment->cars, sizeof(Car*) * (newSegment->carCount + 1));
+            if (resizedCars == NULL) {
+                SDL_Log("Error: realloc failed while adding car to new segment.\n");
+                continue;
+            }
+            newSegment->cars = resizedCars;
             newSegment->cars[newSegment->carCount] = car;
             newSegment->carCount++;
         }
     }
 }
 
+// Update the lateral offset of a car based on potential collisions
 double updateCarOffset(Game* game, Car* car, Segment* carSegment, Segment* playerSegment, double playerW) {
-    int lookahead = 20; // Number of segments to look ahead to avoid collisions
+    const int lookahead = 20; // Number of segments to look ahead to avoid collisions
     double carW = car->sprite->w * SPRITE_SCALE; // Width of the car in game units
 
     // If the car is too far from the player, skip adjusting its offset
     if ((carSegment->index - playerSegment->index) > game->drawDistance)
-        return 0;
+        return 0.0;
 
     // Check each segment in the lookahead distance for potential obstacles
     for (int i = 1; i < lookahead; i++) {
@@ -435,14 +435,14 @@ double updateCarOffset(Game* game, Car* car, Segment* carSegment, Segment* playe
             double dir;
             // Determine which direction to steer based on player's position
             if (game->playerX > 0.5)
-                dir = -1;  // Player is on the right; steer left
+                dir = -1.0;  // Player is on the right; steer left
             else if (game->playerX < -0.5)
-                dir = 1;   // Player is on the left; steer right
+                dir = 1.0;   // Player is on the left; steer right
             else
-                dir = (car->offset > game->playerX) ? 1 : -1; // Choose direction based on relative position
+                dir = (car->offset > game->playerX) ? 1.0 : -1.0; // Choose direction based on relative position
 
             // Return calculated steering adjustment
-            return dir * 1.0 / i * (car->speed - game->speed) / game->maxSpeed;
+            return dir * (1.0 / i) * (car->speed - game->speed) / game->maxSpeed;
         }
 
         // Check each car in the segment for possible collision avoidance
@@ -455,14 +455,14 @@ double updateCarOffset(Game* game, Car* car, Segment* carSegment, Segment* playe
                 double dir;
                 // Determine direction to steer based on the other car's position
                 if (otherCar->offset > 0.5)
-                    dir = -1;  // Other car is on the right; steer left
+                    dir = -1.0;  // Other car is on the right; steer left
                 else if (otherCar->offset < -0.5)
-                    dir = 1;   // Other car is on the left; steer right
+                    dir = 1.0;   // Other car is on the left; steer right
                 else
-                    dir = (car->offset > otherCar->offset) ? 1 : -1; // Choose direction based on relative position
+                    dir = (car->offset > otherCar->offset) ? 1.0 : -1.0; // Choose direction based on relative position
 
                 // Return calculated steering adjustment
-                return dir * 1.0 / i * (car->speed - otherCar->speed) / game->maxSpeed;
+                return dir * (1.0 / i) * (car->speed - otherCar->speed) / game->maxSpeed;
             }
         }
     }
@@ -473,15 +473,42 @@ double updateCarOffset(Game* game, Car* car, Segment* carSegment, Segment* playe
     else if (car->offset > 0.9)
         return -0.1; // Adjust left if too far right
     else
-        return 0;    // No steering adjustment needed
+        return 0.0;    // No steering adjustment needed
 }
 
-// Checks if two objects overlap based on their positions and widths.
-int overlap(double x1, double w1, double x2, double w2, double percent) {
-    // Calculate half of the combined widths, scaled by the overlap threshold percentage.
-    double half = (w1 + w2) * (percent / 2.0);
+double calculateHorizonY(Game* game) {
+    double horizonZ = game->drawDistance * SEGMENT_LENGTH; 
+    horizonZ += 200;
+    double targetPos = game->position + horizonZ;
 
-    // Check if the distance between x1 and x2 is less than the calculated half width.
-    // If true, it means the objects are within the overlap threshold.
-    return fabs(x1 - x2) < half;
+    if (targetPos >= game->road.trackLength) {
+        targetPos = fmod(targetPos, game->road.trackLength);
+    }
+
+    Segment* farSegment = findSegment(game, targetPos);
+    if (!farSegment) {
+        return (double)game->height / 2.0; 
+    }
+
+    double segmentPercent = fmod(targetPos, SEGMENT_LENGTH) / SEGMENT_LENGTH;
+    double baselineY = interpolate(farSegment->p1.world.y, farSegment->p2.world.y, segmentPercent);
+
+    Point horizonPoint;
+    horizonPoint.world.x = 0.0;          
+    horizonPoint.world.y = baselineY;  
+    horizonPoint.world.z = farSegment->p1.world.z; 
+
+    double roadWidth = ROAD_WIDTH;
+    double playerY = calculateElevation(findSegment(game, game->position), game->position);
+    double cameraX = (game->playerX * roadWidth);
+    double cameraY = playerY + CAMERA_HEIGHT;
+    double cameraZ = game->position;  
+    if (cameraZ >= game->road.trackLength) {
+        cameraZ = fmod(cameraZ, game->road.trackLength);
+    }
+    
+    project(&horizonPoint, cameraX, cameraY, cameraZ, game->cameraDepth, 
+            game->width, game->height, roadWidth);
+
+    return horizonPoint.screen.y;
 }

@@ -5,8 +5,6 @@
 #include "constants.h"
 #include <SDL2/SDL.h>
 
-
-// Forward declaration
 struct Game;
 
 typedef struct {
@@ -42,8 +40,6 @@ typedef struct {
     int carCount;
 } Road;
 
-void buildRoad(struct Game* game);
-Segment* findSegment(struct Game* game, double position);
 void resetRoad(struct Game* game);
 void resetSprites(struct Game* game);
 void resetCars(struct Game* game);
@@ -58,5 +54,7 @@ void addLowRollingHills(struct Game* game, int num, double height);
 void addSCurves(struct Game* game);
 void addBumps(struct Game* game);
 void addDownhillToEnd(struct Game* game, int num);
+Segment* findSegment(struct Game* game, double position);
+double calculateElevation(Segment* segment, double position);
 
 #endif // ROAD_H

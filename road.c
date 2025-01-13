@@ -1,7 +1,8 @@
 // road.c
-#include "road.h"
 #include "game.h"
+#include "road.h"
 #include "util.h"
+#include "level.h"
 #include <stdlib.h>
 #include <math.h>
 
@@ -203,26 +204,58 @@ void resetRoad(Game* game) {
     free(game->road.segments);                // Free the segment array
     game->road.segments = NULL;               // Reset segment pointer to NULL
     game->road.segmentCount = 0;              // Reset the segment count
-
-    // Add road features to create a predefined track layout
-    addStraight(game, ROAD_LENGTH_SHORT);           // Short straight section
-    addLowRollingHills(game, 0, 0);                 // Rolling hills with minimal curvature
-    addSCurves(game);                               // Series of S-curves for variation
-    addCurve(game, ROAD_LENGTH_MEDIUM, ROAD_CURVE_MEDIUM, ROAD_HILL_LOW); // Medium curve with a gentle hill
-    addBumps(game);                                 // Add bumpy section for road texture
-    addLowRollingHills(game, 0, 0);                 // Another set of rolling hills
-    addCurve(game, ROAD_LENGTH_LONG * 2, ROAD_CURVE_MEDIUM, ROAD_HILL_MEDIUM); // Long curve with a medium hill
-    addStraight(game, 0);                           // Straight section to reset road alignment
-    addHill(game, ROAD_LENGTH_MEDIUM, ROAD_HILL_HIGH); // High hill for steep elevation change
-    addSCurves(game);                               // More S-curves for challenging turns
-    addCurve(game, ROAD_LENGTH_LONG, -ROAD_CURVE_MEDIUM, ROAD_HILL_NONE); // Downward curve with no hill
-    addHill(game, ROAD_LENGTH_LONG, ROAD_HILL_HIGH); // High hill for ascent
-    addCurve(game, ROAD_LENGTH_LONG, ROAD_CURVE_MEDIUM, -ROAD_HILL_LOW); // Curve with descent
-    addBumps(game);                                 // Another bumpy section
-    addHill(game, ROAD_LENGTH_LONG, -ROAD_HILL_MEDIUM); // Medium hill with descent
-    addStraight(game, 0);                           // Flat straight section
-    addSCurves(game);                               // Final S-curve sequence
-    addDownhillToEnd(game, 0);                      // Long downhill to finish the track
+    // 2) store the loaded commands in game->loadedRoadData
+    LevelRoadData* rd = &game->loadedRoadData;
+    // If no commands, fallback to default:
+    if (rd->commandCount <= 0) {
+        SDL_Log("resetRoad: No road commands found; building default track.\n");
+        // add func call here for building default road
+    } else {
+        SDL_Log("resetRoad: Using loaded road commands.\n");
+        for (int i = 0; i < rd->commandCount; i++) {
+            RoadCommand* cmd = &rd->commands[i];
+            // interpret the commands
+            if (strcmp(cmd->type, "straight") == 0) {
+                // param[0] is the "num"
+                int num = (cmd->paramCount > 0) ? (int)cmd->params[0] : 0;
+                addStraight(game, num);
+            }
+            else if (strcmp(cmd->type, "hill") == 0) {
+                // param[0] => num, param[1] => height
+                int num = (cmd->paramCount > 0) ? (int)cmd->params[0] : 0;
+                double height = (cmd->paramCount > 1) ? cmd->params[1] : 0.0;
+                addHill(game, num, height);
+            }
+            else if (strcmp(cmd->type, "curve") == 0) {
+                // param[0] => num, param[1] => curve, param[2] => height
+                int num = (cmd->paramCount > 0) ? (int)cmd->params[0] : 0;
+                double curveVal = (cmd->paramCount > 1) ? cmd->params[1] : 0.0;
+                double height = (cmd->paramCount > 2) ? cmd->params[2] : 0.0;
+                addCurve(game, num, curveVal, height);
+            }
+            else if (strcmp(cmd->type, "lowRollingHills") == 0) {
+                // param[0] => num, param[1] => height
+                int num = (cmd->paramCount > 0) ? (int)cmd->params[0] : 0;
+                double height = (cmd->paramCount > 1) ? cmd->params[1] : 0.0;
+                addLowRollingHills(game, num, height);
+            }
+            else if (strcmp(cmd->type, "sCurves") == 0) {
+                // no params needed
+                addSCurves(game);
+            }
+            else if (strcmp(cmd->type, "bumps") == 0) {
+                addBumps(game);
+            }
+            else if (strcmp(cmd->type, "downhillToEnd") == 0) {
+                // param[0] => num
+                int num = (cmd->paramCount > 0) ? (int)cmd->params[0] : 0;
+                addDownhillToEnd(game, num);
+            }
+            else {
+                SDL_Log("resetRoad: Unknown command '%s'. Skipping.\n", cmd->type);
+            }
+        }
+    }
 
     // Reset road sprites and cars to their default positions
     resetSprites(game);                             // Place scenery objects along the track
@@ -369,4 +402,9 @@ void resetCars(Game* game) {
 Segment* findSegment(Game* game, double position) {
     int index = (int)(position / SEGMENT_LENGTH) % game->road.segmentCount;
     return &game->road.segments[index];
+}
+
+double calculateElevation(Segment* segment, double position) {
+    double segmentPosition = fmod(position, SEGMENT_LENGTH) / SEGMENT_LENGTH;
+    return segment->p1.world.y + (segment->p2.world.y - segment->p1.world.y) * segmentPosition;
 }
