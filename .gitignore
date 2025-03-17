@@ -1,8 +1,0 @@
-*.log
-*.tmp
-*.py
-*.txt
-node_modules/
-bin/
-obj/
-.vscode/
