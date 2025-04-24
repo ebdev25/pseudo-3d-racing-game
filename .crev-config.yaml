@@ -1,0 +1,21 @@
+# Configuration for the crev tool
+# For more info see: https://crevcli.com/docs
+
+# specify your CREV API key (necessary for review command)
+# You can get one on: https://crevcli.com/api-key
+crev_api_key: # ex. csk_8e796a8f6fdb15f0902eee0d4138b9d5975e244e6cc61ef502feaf37af24c7cb
+
+# specify the prefixes of files and directories to ignore (by default common configuration files are ignored)
+ignore-pre: [] # ex. [tests, readme.md, scripts]
+
+# specify the extensions of files to ignore
+ignore-ext:
+  - .txt
+  - .py
+  - .md
+
+# specify the extensions of files to include
+include-ext: [] # empty means include all except those in `ignore-ext`
+
+# exclude executable files (Linux executables do not have specific extensions, so they are filtered by permissions)
+ignore-executable: true
