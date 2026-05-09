@@ -1,0 +1,16 @@
+# binaries
+game
+racer
+*.out
+
+# object files
+*.o
+
+# build dirs
+build/
+
+# editor stuff
+.vscode/
+
+# OS junk
+.DS_Store
