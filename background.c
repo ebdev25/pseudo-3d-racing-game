@@ -28,24 +28,15 @@ BackgroundColor interpolateColor(const BackgroundColor* start, const BackgroundC
     };
 }
 
+/*
+ * Clear non-owning texture pointers on cycle states. The Game owns the SDL_Texture
+ * (game->background); destroy that from game teardown, not here.
+ */
 void freeBackgroundResources(SlidingWindow* window) {
-    if (!window) return;
-
-    // Free textures in each cycle state
-    for (int i = 0; i < window->cycleStateCount; i++) {
-        BackgroundCycleState* state = &window->cycleStates[i];
-
-        if (state->texture) {
-            SDL_DestroyTexture(state->texture);
-            state->texture = NULL;
-        }
+    if (!window || !window->cycleStates) {
+        return;
     }
-
-    // Free the cycleStates array
-    free(window->cycleStates);
-    window->cycleStates = NULL;
-
-    // Free the SlidingWindow itself
-    free(window);
-    window = NULL;
+    for (int i = 0; i < window->cycleStateCount; i++) {
+        window->cycleStates[i].texture = NULL;
+    }
 }

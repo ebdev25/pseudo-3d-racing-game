@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include "background.h"
 #include "color.h"
+#include "constants.h"
 
 typedef struct {
     Color lightGrass;  // hex #xx for the 'light' grass color
@@ -37,6 +38,34 @@ typedef struct {
     RoadCommand* commands; 
     int commandCount;
 } LevelRoadData;
+
+/* Roadside props: segmentIndex < 0 counts back from end (e.g. -25 -> last 25th segment). */
+typedef struct {
+    const Sprite* sprite;
+    int segmentIndex;
+    double offset;
+} LevelSceneryItem;
+
+typedef struct {
+    const Sprite* sprite;
+    double offset;
+} LevelSceneryRepeatPlacement;
+
+/* fromSegment / toSegment may be negative (resolved against segment count in resetSprites). */
+typedef struct {
+    int fromSegment;
+    int toSegment;
+    int step;
+    LevelSceneryRepeatPlacement* placements;
+    int placementCount;
+} LevelSceneryRepeatRule;
+
+typedef struct {
+    LevelSceneryItem* items;
+    int itemCount;
+    LevelSceneryRepeatRule* repeatRules;
+    int repeatRuleCount;
+} LevelSceneryData;
 
 // Level structure
 typedef struct {

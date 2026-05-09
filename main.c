@@ -1,16 +1,36 @@
+/*
+ * main.c — process lifetime ownership of SDL subsystems and the window/renderer:
+ *   SDL_Init / SDL_Quit
+ *   IMG_Init / IMG_Quit
+ *   TTF_Init / TTF_Quit
+ *   Mix_OpenAudio / Mix_CloseAudio
+ * SDL_Window and SDL_Renderer are created and destroyed here; Game only borrows renderer.
+ * Game-owned GPU data (textures, fonts, Mix_Music/Mix_Chunk from initGame) are freed in cleanupGame().
+ */
 // main.c
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_image.h>
 #include <SDL2/SDL_ttf.h>
 #include "game.h"
+#include "paths.h"
 
 int main(int argc, char* argv[]) {
+    // Suppress unused parameter warnings
+    (void)argc;
+    (void)argv;
+
     SDL_Window* window = NULL;
     SDL_Renderer* renderer = NULL;
 
     // Initialize SDL with video, timer, and audio
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_AUDIO) < 0) {
         SDL_Log("SDL_Init Error: %s", SDL_GetError());
+        return 1;
+    }
+
+    if (!paths_init()) {
+        SDL_Log("paths_init failed");
+        SDL_Quit();
         return 1;
     }
 
@@ -70,7 +90,17 @@ int main(int argc, char* argv[]) {
     Game game;
     // Game struct field initialization
     memset(&game, 0, sizeof(Game));
-    initGame(&game, renderer);
+    if (!initGame(&game, renderer, (argc > 1 && argv[1] && argv[1][0]) ? argv[1] : NULL)) {
+        SDL_Log("initGame failed");
+        paths_quit();
+        Mix_CloseAudio();
+        TTF_Quit();
+        IMG_Quit();
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
 
     Uint32 lastTime = SDL_GetTicks();
     double dt = 0;
@@ -122,8 +152,8 @@ int main(int argc, char* argv[]) {
 
     } // End Main Game Loop
 
-    // Cleanup
     cleanupGame(&game);
+    paths_quit();
 
     Mix_CloseAudio();
     TTF_Quit();

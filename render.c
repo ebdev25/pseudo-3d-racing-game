@@ -16,6 +16,7 @@ static void renderStateLayers(SDL_Renderer* renderer,
                               int screenHeight,
                               bool disableWrapping)
 {
+    (void)screenHeight;
     // For each of the 3 layers in this state
     for (int i = 0; i < 3; i++) {
 
@@ -250,8 +251,7 @@ static void renderTrafficLight(Game* game)
 
     // sprite scale and position for projection
     double spriteScale = seg->p1.scale;  
-    double spriteX = seg->p1.screen.x + (spriteScale * (-1.2) * 
-                        ROAD_WIDTH * game->width / 2.0);
+    double spriteX = seg->p1.screen.x + (spriteScale * (-1.2) * ROAD_WIDTH * game->width / 2.0);
     double spriteY = seg->p1.screen.y;
 
     // Current frame in the animation
@@ -344,7 +344,6 @@ void render(Game* game) {
     SDL_Renderer* renderer = game->renderer;
     int width = game->width;
     int height = game->height;
-    double resolution = game->resolution;
     double roadWidth = ROAD_WIDTH;
     double cameraHeight = CAMERA_HEIGHT;
     double cameraDepth = game->cameraDepth;
@@ -356,7 +355,6 @@ void render(Game* game) {
     int lanes = LANE_COUNT;
     int drawDistance = DRAW_DISTANCE;
 
-    SDL_Texture* background = game->background;
     SDL_Texture* spritesheet = game->spritesheet;
 
     // Clear the screen with black to reset the frame
@@ -499,6 +497,7 @@ void renderSlidingWindow(SDL_Renderer* renderer,
                          int screenHeight,
                          bool disableWrapping)
 {
+    (void)cameraSpeed;
     if (!window || window->cycleStateCount <= 0) 
         return;
 
@@ -533,6 +532,8 @@ void renderSlidingWindow(SDL_Renderer* renderer,
 // Render a road segment with rumble strips, road surface, and lane markers
 void renderSegment(SDL_Renderer* renderer, int width, int lanes, double x1, double y1, double w1,
                    double x2, double y2, double w2, const ColorScheme* color) {
+    (void)width; // Unused parameter
+    
     // Calculate rumble strip width based on lane width for the top and bottom of the segment
     double r1 = rumbleWidth(w1, lanes);
     double r2 = rumbleWidth(w2, lanes);
@@ -627,7 +628,6 @@ void renderSprite(Game* game, SDL_Texture* spritesheet, const Sprite* sprite, do
 
     SDL_Renderer* renderer = game->renderer;
     int width = game->width;
-    int height = game->height;
 
     // Dimensions of the original sprite
     int spriteWidth = sprite->w;

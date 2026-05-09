@@ -6,8 +6,10 @@
 #include "render.h"
 #include "constants.h"
 #include "level_loader.h"
+#include "paths.h"
 #include "ai.h"
 #include "collision.h"
+#include "leaderboard.h"
 
 #include <SDL2/SDL_image.h>
 #include <SDL2/SDL_ttf.h>
@@ -16,9 +18,10 @@
 #include <math.h>
 #include <time.h>
 #include <stdio.h>
+#include <stdalign.h>
 
-// Forward declarations
-int compareLeaderboardEntries(const void* a, const void* b);
+#define FRAME_ARENA_BYTES (16u * 1024u * 1024u) // 16 mb of memory
+#define LEVEL_ARENA_BYTES (64u * 1024u * 1024u) // 64 mb of memory
 // Racing lights update func
 static void updateTrafficLightAnimation(Game* game, double dt)
 {
@@ -49,6 +52,164 @@ static void updateTrafficLightAnimation(Game* game, double dt)
             }
 
             return;
+        }
+    }
+}
+
+static void updateAIAndCollisions(Game* game, double dt, Segment* playerSeg) {
+    double playerW = SPRITE_PLAYER_STRAIGHT.w * SPRITE_SCALE;
+
+    updateAIController(&game->aiController, dt);
+    checkAIDriverCollisions(game);
+    checkPlayerAIOpponentCollisions(game);
+
+    // AI ramming logic
+    for (int i = 0; i < game->aiController.driverCount; i++) {
+        AIDriver* ai = &game->aiController.drivers[i];
+        Segment* aiSeg = findSegment(game, ai->z);
+        if (aiSeg != playerSeg) continue;
+
+        double aiW = (ai->sprite ? ai->sprite->w : 80) * SPRITE_SCALE;
+
+        if (ai->isRamming && overlap(game->playerX, playerW, ai->offset, aiW, 1.0)) {
+            double push = 0.1 * dt * 60;
+            game->playerX += (ai->offset < game->playerX) ? push : -push;
+        }
+    }
+}
+
+static void updatePlayerPhysics(Game* game, double dt, Segment* seg) {
+    double speedPercent = (game->maxSpeed > 0.0) ? (game->speed / game->maxSpeed) : 0.0;
+    double dx = dt * 2.0 * speedPercent;
+
+    game->position = increase(game->position, dt * game->speed, game->road.trackLength);
+
+    if (!game->inCollisionPush) {
+        if (game->keyLeft)  game->playerX -= dx;
+        if (game->keyRight) game->playerX += dx;
+    }
+
+    game->playerX -= dx * speedPercent * seg->curve * game->centrifugal;
+
+    if (game->keyAccelerate)
+        game->speed = accelerate(game->speed, game->accel, dt);
+    else if (game->keyBrake)
+        game->speed = accelerate(game->speed, game->breaking, dt);
+    else
+        game->speed = accelerate(game->speed, game->decel, dt);
+
+    game->playerX = limit(game->playerX, -3.0, 3.0);
+    game->speed   = limit(game->speed, 0.0, game->maxSpeed);
+}
+
+static void handleOffRoadCollisions(Game* game, double dt, Segment* seg) {
+    if (game->playerX > -1.0 && game->playerX < 1.0)
+        return;
+
+    if (game->speed <= game->offRoadLimit)
+        return;
+
+    game->speed = accelerate(game->speed, game->offRoadDecel, dt);
+
+    for (int i = 0; i < seg->spriteCount; i++) {
+        SpriteInstance* s = &seg->sprites[i];
+        double spriteW = (s->source->useCustomCollisionBox ?
+                          s->source->collisionWidth : s->source->w) * SPRITE_SCALE;
+        double offsetX  = (s->source->useCustomCollisionBox ?
+                           s->source->collisionOffsetX : 0.0) * SPRITE_SCALE;
+
+        double center = s->offset + offsetX;
+
+        if (overlap(game->playerX, SPRITE_PLAYER_STRAIGHT.w * SPRITE_SCALE, center, spriteW, 1.0)) {
+            game->speed = game->maxSpeed / 5.0;
+            game->position = increase(seg->p1.world.z, -game->playerZ, game->road.trackLength);
+            game->collisionResetOccurredThisFrame = true;
+            return;
+        }
+    }
+}
+
+static void updateLapLogic(Game* game, double startPosition) {
+    if (game->position >= startPosition || game->collisionResetOccurredThisFrame)
+        return;
+
+    if (!(game->position < startPosition && startPosition > game->playerZ))
+        return;
+
+    if (game->currentLapTime <= 1.0)
+        return;
+
+    // crossed start line
+    game->playerLapsCompleted++;
+    game->lastLapTime = game->currentLapTime;
+    game->currentLapTime = 0.0;
+
+    if (game->playerLapsCompleted >= game->totalLaps && !game->raceFinished) {
+        game->raceState = RACE_STATE_FINISHED;
+        game->movementAllowed = false;
+        game->raceFinished = true;
+
+        Mix_HaltMusic();
+        generateLeaderboard(game);
+        game->showLeaderboard = true;
+
+        bool won = (game->leaderboard.isActive &&
+                    game->leaderboard.entryCount > 0 &&
+                    game->leaderboard.entries[0].isPlayer);
+
+        Mix_PlayChannel(-1, won ? game->victorySound : game->loseSound, 0);
+    }
+
+    game->lodCycleThreshold = game->road.trackLength / 3.0;
+}
+
+static void updateBackgroundParallax(Game* game, Segment* playerSegment, double startPosition, double dt)
+{
+    // Parallax updates only when not transitioning and system is valid
+    if (!game->transitionHappening && game->slidingWindow && game->currentCycleState) {
+
+        // --- First parallax update (baseline) ---
+        double elevation = calculateElevation(playerSegment, game->position);
+        updateParallax(
+            game,
+            game->slidingWindow,
+            game->currentCycleState,
+            game->speed,
+            playerSegment->curve,
+            elevation,
+            game->position,
+            startPosition,
+            dt,
+            game->horizonY,
+            game->transitionHappening
+        );
+    }
+
+    // Final parallax sync before transitions; uses updated segment/elevation to prevent visual pops
+    if (!game->transitionHappening && game->slidingWindow && game->currentCycleState) {
+
+        Segment* currentSegmentForParallax = findSegment(game, game->position + game->playerZ);
+        if (currentSegmentForParallax) {
+
+            double elevation = calculateElevation(currentSegmentForParallax, game->position);
+            double previousPosition = startPosition;  // exactly the same as before
+
+            updateParallax(
+                game,
+                game->slidingWindow,
+                game->currentCycleState,
+                game->speed,
+                currentSegmentForParallax->curve,
+                elevation,
+                game->position,
+                previousPosition,
+                dt,
+                game->horizonY,
+                false     // Always false for the sync pass
+            );
+        }
+        else {
+            SDL_Log("Warning: Player segment null before pre-transition parallax update.");
         }
     }
 }
@@ -204,24 +365,29 @@ void resetGameForStart(Game* game) {
     SDL_Log("Game state reset complete.");
 }
 
-// Initialize the game
-void initGame(Game* game, SDL_Renderer* renderer) {
+// Initialize the game (SDL_Init / TTF_Init / Mix_OpenAudio / IMG_Init: owned by main.c)
+bool initGame(Game* game, SDL_Renderer* renderer, const char* levelRelPath) {
+    game->frameArenaCap = FRAME_ARENA_BYTES;
+    game->frameArenaStart = SDL_malloc(game->frameArenaCap);
+    if (!game->frameArenaStart) {
+        SDL_Log("Allocation for frame arena start failed: (%zu bytes)", game->frameArenaCap);
+        return false;
+    }
+    arena_init(&game->frameArena, game->frameArenaStart, game->frameArenaCap);
+
+    game->levelArenaCap = LEVEL_ARENA_BYTES;
+    game->levelArenaStart = SDL_malloc(game->levelArenaCap);
+    if (!game->levelArenaStart) {
+        SDL_Log("Allocation for level arena start failed: (%zu bytes)", game->levelArenaCap);
+        SDL_free(game->frameArenaStart);
+        game->frameArenaStart = NULL;
+        return false;
+    }
+    arena_init(&game->levelArena, game->levelArenaStart, game->levelArenaCap);
+
     game->raceState = RACE_STATE_COUNTDOWN;
-    game->movementAllowed = false; 
-    // Initialize SDL_ttf for text rendering in the HUD
-    if (TTF_Init() == -1) {
-        SDL_Log("TTF_Init Error: %s", TTF_GetError());
-        exit(1);
-    }
+    game->movementAllowed = false;
 
-    // Initialize SDL_mixer for audio
-    if (Mix_OpenAudio(44100, MIX_DEFAULT_FORMAT, 2, 2048) < 0) {
-        SDL_Log("Mix_OpenAudio Error: %s", Mix_GetError());
-        TTF_Quit();
-        exit(1);
-    }
-
-    // Set up renderer and screen dimensions
     game->renderer = renderer;
     game->width = WIDTH;  // Screen width
     game->height = HEIGHT; // Screen height
@@ -267,67 +433,76 @@ void initGame(Game* game, SDL_Renderer* renderer) {
     // Sliding Window init to NULL
     game->slidingWindow = NULL;
 
-    // Load the level and associated resources
-    if (!loadLevel(game, "/home/horatiobelter/Desktop/Programming/Pseudo 3D Racer/levels/beach_test.json")) {
-        SDL_Log("Failed to load level.\n");
-        Mix_CloseAudio();
-        TTF_Quit();
-        exit(1);
+    const char* levelPath = (levelRelPath && levelRelPath[0]) ? levelRelPath : DEFAULT_LEVEL_REL_PATH;
+    if (!loadLevel(game, levelPath)) {
+        SDL_Log("Failed to load level: %s", levelPath);
+        goto fail;
     }
 
-    // Load animated sprites
-    SDL_Texture* animTex = IMG_LoadTexture(renderer, "../resources/animated_sprites.png");
+    char assetPath[1024];
+
+    if (!paths_resolve(assetPath, sizeof(assetPath), "resources/animated_sprites.png")) {
+        SDL_Log("Failed to find resources/animated_sprites.png");
+        goto fail;
+    }
+    SDL_Texture* animTex = IMG_LoadTexture(renderer, assetPath);
     if (!animTex) {
         SDL_Log("Failed to load animated sprites: %s", IMG_GetError());
-        Mix_CloseAudio();
-        TTF_Quit();
-        exit(1);
+        goto fail;
     }
     game->animatedSpritesheet = animTex;
 
-    game->trafficLightSound = Mix_LoadMUS("../resources/racing_lights_sound_longer.mp3");
+    if (!paths_resolve(assetPath, sizeof(assetPath), "resources/racing_lights_sound_longer.mp3")) {
+        SDL_Log("Failed to find resources/racing_lights_sound_longer.mp3");
+        goto fail;
+    }
+    game->trafficLightSound = Mix_LoadMUS(assetPath);
     if (!game->trafficLightSound) {
         SDL_Log("Failed to load traffic light sound: %s", Mix_GetError());
-        Mix_CloseAudio();
-        TTF_Quit();
-        exit(1);
+        goto fail;
     }
 
-    // Load HUD font
-    game->hudFont = TTF_OpenFont("../resources/PressStart2P-Regular.ttf", 24);
+    if (!paths_resolve(assetPath, sizeof(assetPath), "resources/PressStart2P-Regular.ttf")) {
+        SDL_Log("Failed to find resources/PressStart2P-Regular.ttf");
+        goto fail;
+    }
+    game->hudFont = TTF_OpenFont(assetPath, 24);
     if (!game->hudFont) {
         SDL_Log("Failed to load font: %s", TTF_GetError());
-        TTF_Quit();
-        exit(1);
+        goto fail;
     }
 
-    // Initialize UI system AFTER font is loaded
-    initUI(&game->ui, game->hudFont); // Pass the loaded font
-    setUIState(&game->ui, UI_STATE_START_MENU); // Start with the main menu
+    initUI(&game->ui, game->hudFont);
+    setUIState(&game->ui, UI_STATE_START_MENU);
 
-    // Load UI navigation sound
-    game->uiNavigationSound = Mix_LoadWAV("../resources/uiNavSound.wav");
+    if (!paths_resolve(assetPath, sizeof(assetPath), "resources/uiNavSound.wav")) {
+        SDL_Log("Failed to find resources/uiNavSound.wav");
+        goto fail;
+    }
+    game->uiNavigationSound = Mix_LoadWAV(assetPath);
     if (!game->uiNavigationSound) {
         SDL_Log("Failed to load ui nav sound: %s", Mix_GetError());
-        Mix_CloseAudio();
-        TTF_Quit();
-        exit(1);
+        goto fail;
     }
 
-    game->victorySound = Mix_LoadWAV("../resources/WonRace.WAV");
+    if (!paths_resolve(assetPath, sizeof(assetPath), "resources/WonRace.WAV")) {
+        SDL_Log("Failed to find resources/WonRace.WAV");
+        goto fail;
+    }
+    game->victorySound = Mix_LoadWAV(assetPath);
     if (!game->victorySound) {
         SDL_Log("Failed to load victory sound: %s", Mix_GetError());
-        Mix_CloseAudio();
-        TTF_Quit();
-        exit(1);    
+        goto fail;    
     }
 
-    game->loseSound = Mix_LoadWAV("../resources/LostRace.wav");
+    if (!paths_resolve(assetPath, sizeof(assetPath), "resources/LostRace.wav")) {
+        SDL_Log("Failed to find resources/LostRace.wav");
+        goto fail;
+    }
+    game->loseSound = Mix_LoadWAV(assetPath);
     if (!game->loseSound) {
         SDL_Log("Failed to load lose sound: %s", Mix_GetError());
-        Mix_CloseAudio();
-        TTF_Quit();
-        exit(1);
+        goto fail;
     }
 
     // Initialize Leaderboard fields
@@ -342,8 +517,8 @@ void initGame(Game* game, SDL_Renderer* renderer) {
 
     // Initialize the Animation fields
     game->trafficLightAnim.frameCount = 5;
-    game->trafficLightAnim.frames = (const Sprite**)malloc(sizeof(Sprite*) * 5);
-    game->trafficLightAnim.frameDurations = (double*)malloc(sizeof(double) * 5);
+    game->trafficLightAnim.frames = arena_alloc(&game->levelArena, sizeof(Sprite*) * 5, alignof(Sprite*));
+    game->trafficLightAnim.frameDurations = arena_alloc(&game->levelArena, sizeof(double) * 5, alignof(double));
 
     // Attach the 5 frames
     game->trafficLightAnim.frames[0] = &SPRITE_LIGHT_FRAME1; 
@@ -363,13 +538,14 @@ void initGame(Game* game, SDL_Renderer* renderer) {
     game->trafficLightAnim.finished     = false;
     game->trafficLightAnim.loop         = false;  // play once
 
-    // Load opponent spritesheet
-    SDL_Texture* oppTex = IMG_LoadTexture(renderer, "/home/horatiobelter/Desktop/Programming/Pseudo 3D Racer/resources/opponents_sheet_v2.png");
+    if (!paths_resolve(assetPath, sizeof(assetPath), "resources/opponents_sheet_v3.png")) {
+        SDL_Log("Failed to find resources/opponents_sheet_v3.png");
+        goto fail;
+    }
+    SDL_Texture* oppTex = IMG_LoadTexture(renderer, assetPath);
     if (!oppTex) {
         SDL_Log("Failed to load opponent sprites: %s", IMG_GetError());
-        Mix_CloseAudio();
-        TTF_Quit();
-        exit(1);
+        goto fail;
     }
     game->opponentSpritesheet = oppTex;
 
@@ -422,6 +598,12 @@ void initGame(Game* game, SDL_Renderer* renderer) {
             state->offsets[i].y = idealY;
         }
     }
+
+    return true;
+
+fail:
+    cleanupGame(game);
+    return false;
 }
 
 int handleEvent(Game* game, SDL_Event* event) {
@@ -538,278 +720,51 @@ int handleEvent(Game* game, SDL_Event* event) {
 
 // Update the game state
 void updateGame(Game* game, double dt) {
+    arena_reset(&game->frameArena);
     game->collisionResetOccurredThisFrame = false;
-    // Update Countdown Animation
-    // update traffic light animation during countdown phase
+
     if (game->raceState == RACE_STATE_COUNTDOWN) {
         updateTrafficLightAnimation(game, dt);
+        return;
     }
 
-    // Main Game Logic, Physics, AI, Player Control
-    // Only run core game updates if movement allowed and UI not active
-    if (game->movementAllowed && game->ui.currentState == UI_STATE_NONE) {
+    if (!(game->movementAllowed && game->ui.currentState == UI_STATE_NONE))
+        return;
 
-        double playerW = SPRITE_PLAYER_STRAIGHT.w * SPRITE_SCALE;
-
-        // Percentage of max speed that player is currently moving
-        double speedPercent = (game->maxSpeed > 0.0) ? (game->speed / game->maxSpeed) : 0.0; // Avoid div by zero
-
-        // Horizontal movement increment based on time step and speed
-        double dx = dt * 2.0 * speedPercent;
-
-        // Store start pos to calculate distance moved for lap timing
-        double startPosition = game->position;
-
-        // Update total race time only when race running
-        if(game->raceState == RACE_STATE_RUNNING) {
-             game->totalRaceTime += dt;
-             game->currentLapTime += dt;
-        }
-
-
-        // Find current player seg
-        Segment* playerSegment = findSegment(game, game->position + game->playerZ);
-        if (playerSegment == NULL) {
-            SDL_Log("Error: Player segment not found in updateGame.\n");
-            return;
-        }
-
-        // Update AI opponents
-        updateAIController(&game->aiController, dt);
-
-        // Check for AI driver collisions
-        checkAIDriverCollisions(game);
-
-        // Check for player AI collisions
-        checkPlayerAIOpponentCollisions(game);
-
-        // Process AI colliding w/ player
-        {
-            Segment* seg = findSegment(game, game->position + game->playerZ); // find seg again, pos might have changed significantly
-            if (seg) {
-                for (int i = 0; i < game->aiController.driverCount; i++) {
-                    AIDriver* driver = &game->aiController.drivers[i];
-                     // AI driver in same seg to interact
-                     Segment* aiSeg = findSegment(game, driver->z);
-                     if(aiSeg != seg) continue; // Skip AI in different segments
-
-                    double aiW = (driver->sprite) ? driver->sprite->w * SPRITE_SCALE : 80 * SPRITE_SCALE;
-                    // Check for lateral overlap if the AI in ramming state
-                    if (overlap(game->playerX, playerW, driver->offset, aiW, 1.0) && driver->isRamming) {
-                        // Apply push
-                        double pushForce = 0.1 * dt * 60; // Scale force with dt
-                        game->playerX += (driver->offset < game->playerX) ? pushForce : -pushForce;
-                    }
-                }
-            }
-        }
-
-        // Player Physics and Control
-
-        // Move player pos forward based on current speed
-        game->position = increase(game->position, dt * game->speed, game->road.trackLength);
-
-        // Handle player input for left/right movement (only if not being pushed by collision)
-        if (!game->inCollisionPush) {
-            if (game->keyLeft)
-                game->playerX -= dx;
-            if (game->keyRight)
-                game->playerX += dx;
-        }
-
-        // Apply centrifugal force based on road curve
-        game->playerX -= dx * speedPercent * playerSegment->curve * game->centrifugal;
-
-        // Handle acceleration and deceleration based on input
-        if (game->keyAccelerate)
-            game->speed = accelerate(game->speed, game->accel, dt);
-        else if (game->keyBrake)
-            game->speed = accelerate(game->speed, game->breaking, dt);
-        else
-            game->speed = accelerate(game->speed, game->decel, dt); // Natural deceleration
-
-        // Handle player going off-road
-        if ((game->playerX < -1.0) || (game->playerX > 1.0)) {
-            // Slow down player if exceeding off-road speed limit
-            if (game->speed > game->offRoadLimit)
-                game->speed = accelerate(game->speed, game->offRoadDecel, dt);
-
-            // Check for collision with roadside sprites (e.g., trees, billboards)
-             for (int n = 0; n < playerSegment->spriteCount; n++) {
-                 SpriteInstance* sprite = &playerSegment->sprites[n];
-                 double spriteW = sprite->source->w * SPRITE_SCALE;
-                 // Approximate sprite center for collision check
-                 double spriteCenterOffset = sprite->offset + ((sprite->offset > 0.0) ? (spriteW / 2.0) : (-spriteW / 2.0));
-
-                if (overlap(game->playerX, playerW, sprite->offset + spriteW / 2 * (sprite->offset > 0 ? 1 : -1), spriteW, 1.0)) {
-                    game->speed = game->maxSpeed / 5.0; 
-                    // prevent player moving forward
-                    game->position = increase(playerSegment->p1.world.z, -game->playerZ, game->road.trackLength); 
-
-                    game->collisionResetOccurredThisFrame = true; // prevent lap increment
-
-                    SDL_Log("Collision with roadside sprite detected. Speed reduced and position reset.\n");
-                    break; 
-                }
-             }
-        }
-
-        // Clamp player's horizontal position and speed to limits
-        game->playerX = limit(game->playerX, -3.0, 3.0); // Limit X to prevent going too far off-screen
-        game->speed = limit(game->speed, 0.0, game->maxSpeed); // Ensure speed doesn't exceed max or go below zero
-
-        // Lap Timing and Race Finish Check
-        // Check if the player crossed the start/finish line (position wrapped around)
-        if (!game->collisionResetOccurredThisFrame && game->position < startPosition && startPosition > game->playerZ) { // Wrapped around
-             if(game->currentLapTime > 1.0) { // Debounce crossing line immediately
-                game->playerLapsCompleted++;
-                game->lastLapTime = game->currentLapTime;
-                game->currentLapTime = 0.0; // Reset timer for new lap
-                SDL_Log("Player completed lap #%d in %.2f seconds",
-                        game->playerLapsCompleted, game->lastLapTime);
-
-                // Check if player finished required number laps
-                if (game->playerLapsCompleted >= game->totalLaps && !game->raceFinished) {
-                    SDL_Log("Player has finished the race!");
-                    game->raceState = RACE_STATE_FINISHED;
-                    game->movementAllowed = false; // Stop player control
-                    game->raceFinished = true;
-                    Mix_HaltMusic(); // Stop race music
-                    generateLeaderboard(game); // Calculate and prepare leaderboard data
-                    game->showLeaderboard = true; // Set flag to display leaderboard in renderGame
-                    bool playerWon = false;
-                     // Check if leaderboard was successfully generated and has entries
-                     if (game->leaderboard.isActive && game->leaderboard.entryCount > 0 && game->leaderboard.entries) {
-                         // Player won if the first entry in the sorted list is the player
-                         if (game->leaderboard.entries[0].isPlayer) {
-                             playerWon = true;
-                         }
-                     } else {
-                         SDL_Log("Warning: Leaderboard not active or empty when checking win condition for sound.");
-                         // Default to playing lose sound if leaderboard failed
-                         playerWon = false;
-                     }
-
-                     // Play sound effect once
-                     if (playerWon) {
-                         if (game->victorySound) {
-                             Mix_PlayChannel(-1, game->victorySound, 0); // Play victory sound
-                         }
-                     } else {
-                         if (game->loseSound) {
-                             Mix_PlayChannel(-1, game->loseSound, 0); // Play lose sound
-                         }
-                     }
-                }
-                 // Reset LOD cycle threshold relative to the start line for the new lap
-                 game->lodCycleThreshold = game->road.trackLength / 3.0; // Reset to first third
-             }
-        }
-
-
-        // Background Updates
-
-        // Calculate projected horizon y value based on highest visible road point
-        game->horizonY = calculateHorizonY(game);
-
-        // Update background parallax scrolling only if no transition
-        if (!game->transitionHappening && game->slidingWindow && game->currentCycleState) {
-             double elevation = calculateElevation(playerSegment, game->position);
-             updateParallax(game, game->slidingWindow, game->currentCycleState, game->speed, playerSegment->curve, elevation,
-                           game->position, startPosition, dt, game->horizonY, game->transitionHappening);
-        }
-
-        if (!game->transitionHappening && game->slidingWindow && game->currentCycleState) {
-            Segment* currentSegmentForParallax = findSegment(game, game->position + game->playerZ);
-            if (currentSegmentForParallax) { // Check if segment is valid
-                double elevation = calculateElevation(currentSegmentForParallax, game->position);
-                double previousPosition = startPosition;
-                updateParallax(game, game->slidingWindow, game->currentCycleState, game->speed, currentSegmentForParallax->curve, elevation,
-                               game->position, previousPosition, dt, game->horizonY, false);
-            } else {
-                 SDL_Log("Warning: Player segment null before pre-transition parallax update.");
-            }
-        }
-
-        // Automatically trigger background transition logic when passing LOD threshold
-        if (game->slidingWindow && !game->slidingWindow->transitioning && game->position >= game->lodCycleThreshold) {
-             advanceToNextState(game, game->slidingWindow); // Initiates transition flags
-             // Update the threshold for next transition point
-             game->lodCycleThreshold += (game->road.trackLength / 3.0);
-             // Wrap threshold if exceeds track length
-             if (game->lodCycleThreshold > game->road.trackLength) {
-                 game->lodCycleThreshold -= game->road.trackLength;
-             }
-        }
-
-         // Handle visual scrolling effect during background transition
-         if (game->transitionHappening && game->slidingWindow && game->currentCycleState) {
-            // Update transition color interpolation progress
-             double distanceIntoTransition = increase(game->position, -game->slidingWindow->transitionStartPosition, game->road.trackLength);
-             game->slidingWindow->transitionProgress = limit(distanceIntoTransition / game->slidingWindow->transitionDistance, 0.0, 1.0);
-             updateTransitionColors(game, game->slidingWindow, dt); // Update interpolated colors
-
-             // Calculate how much background scroll needed based on player movement
-             double movementSinceLastFrame = increase(game->position, -startPosition, game->road.trackLength);
-             double backgroundScrollSpeed = movementSinceLastFrame * BACKGROUND_SCROLL_SCALE;
-
-             // Scroll outgoing current state layers leftwards
-             bool allCurrentLayersOffScreen = true;
-             for (int i = 0; i < 3; i++) {
-                 game->currentCycleState->offsets[i].x -= (int)backgroundScrollSpeed;
-
-                 // Check if layer fully off-screen
-                 int texW = game->currentCycleState->textureRects[i].w;
-                 int extraW = game->currentCycleState->extraSlice[i]; // Width of potential second visible part
-                 int effectiveWidth = texW + extraW; // Total width to scroll off
-
-                 if (game->currentCycleState->offsets[i].x > -effectiveWidth) {
-                     allCurrentLayersOffScreen = false; // Still visible
-                 }
-                 // Update Y position dynamically based on horizon
-                 float targetY = (float)game->horizonY - game->currentCycleState->textureRects[i].h + game->currentCycleState->overlapMargins[i];
-                 game->currentCycleState->offsets[i].y = lerp_float(game->currentCycleState->offsets[i].y, targetY, 0.1f); // Smooth Y adjustment
-             }
-
-            // If current state fully off-screen, scroll incoming target state
-            if (allCurrentLayersOffScreen && game->targetCycleState) {
-                 bool targetFullyOnScreen = true;
-                 for (int i = 0; i < 3; i++) {
-                     game->targetCycleState->offsets[i].x -= (int)backgroundScrollSpeed; // Scroll left
-
-                     // Update Y position dynamically based on horizon
-                     float targetY = (float)game->horizonY - game->targetCycleState->textureRects[i].h + game->targetCycleState->overlapMargins[i];
-                     game->targetCycleState->offsets[i].y = lerp_float(game->targetCycleState->offsets[i].y, targetY, 0.1f); // Smooth Y adjustment
-
-                     // Check if layer of target state fully on screen
-                     if (game->targetCycleState->offsets[i].x > 0) { // If left edge still right of screen edge
-                         targetFullyOnScreen = false;
-                     }
-                 }
-
-                 // If all layers of target state are fully visible
-                 if (targetFullyOnScreen) {
-                     // Finalize transition
-                     game->slidingWindow->currentCycleStateIndex = game->slidingWindow->targetCycleStateIndex;
-                     game->currentCycleState = &game->slidingWindow->cycleStates[game->slidingWindow->currentCycleStateIndex];
-                     // Determine next target index (wrapping around)
-                     game->slidingWindow->targetCycleStateIndex = (game->slidingWindow->currentCycleStateIndex + 1) % game->slidingWindow->cycleStateCount;
-                     if (game->slidingWindow->cycleStateCount > 1) {
-                         game->targetCycleState = &game->slidingWindow->cycleStates[game->slidingWindow->targetCycleStateIndex];
-                     } else {
-                         game->targetCycleState = NULL; // No next target if only one state
-                     }
-
-                     // Reset transition flags
-                     game->transitionHappening = 0;
-                     game->slidingWindow->transitioning = false;
-                     game->slidingWindow->transitionProgress = 0.0f; // Reset progress
-
-                     SDL_Log("Background transition complete! Current state: %d\n", game->slidingWindow->currentCycleStateIndex);
-                 }
-             }
-        }
+    if (game->raceState == RACE_STATE_RUNNING) {
+        game->totalRaceTime += dt;
+        game->currentLapTime += dt;
     }
+
+    double startPosition = game->position;
+
+    Segment* playerSegment = findSegment(game, game->position + game->playerZ);
+    if (!playerSegment) {
+        SDL_Log("Error: Player segment not found.");
+        return;
+    }
+
+    updateAIAndCollisions(game, dt, playerSegment);
+    updatePlayerPhysics(game, dt, playerSegment);
+    handleOffRoadCollisions(game, dt, playerSegment);
+    updateLapLogic(game, startPosition);
+
+    // Background Updates
+
+    // Calculate projected horizon y value based on highest visible road point
+    game->horizonY = calculateHorizonY(game);
+
+    // Update background parallax scrolling only if no transition
+    // Final parallax sync before transitions; uses updated segment/elevation to prevent visual pops
+    updateBackgroundParallax(game, playerSegment, startPosition, dt);
+
+    // Automatically trigger background transition logic when passing LOD threshold
+    if (game->slidingWindow && !game->slidingWindow->transitioning && game->position >= game->lodCycleThreshold) {
+        advanceToNextState(game, game->slidingWindow); // Initiates transition flags
+    }
+
+    // Handle visual scrolling effect during background transition
+    updateBackgroundTransition(game, dt, startPosition);
 }
 
 // Render the game
@@ -837,13 +792,30 @@ void renderGame(Game* game) {
     }
 }
 
-// Clean up game resources
+/*
+ * Frees all resources owned by Game (textures, fonts, mixer music/chunks, arenas, sliding window).
+ * Cycle-state .texture pointers are non-owning aliases of game->background; clear them before
+ * destroying the shared texture. Does not call SDL_Quit / TTF_Quit / IMG_Quit — main owns those.
+ */
 void cleanupGame(Game* game) {
-    // Free resources
-    if (game->background)
+    game->currentCycleState = NULL;
+    game->targetCycleState = NULL;
+
+    Mix_HaltMusic();
+    Mix_HaltChannel(-1);
+
+    if (game->slidingWindow) {
+        freeBackgroundResources(game->slidingWindow);
+    }
+
+    if (game->background) {
         SDL_DestroyTexture(game->background);
-    if (game->spritesheet)
+        game->background = NULL;
+    }
+    if (game->spritesheet) {
         SDL_DestroyTexture(game->spritesheet);
+        game->spritesheet = NULL;
+    }
     if (game->opponentSpritesheet) {
         SDL_DestroyTexture(game->opponentSpritesheet);
         game->opponentSpritesheet = NULL;
@@ -852,66 +824,31 @@ void cleanupGame(Game* game) {
         SDL_DestroyTexture(game->animatedSpritesheet);
         game->animatedSpritesheet = NULL;
     }
-    // Free road segments
-    if (game->road.segments) {
-        for (int i = 0; i < game->road.segmentCount; i++) {
-            Segment* segment = &game->road.segments[i];
-            if (segment->sprites)
-                free(segment->sprites);
-        }
-        free(game->road.segments);
-    }
 
-    // Free SlidingWindow
     if (game->slidingWindow) {
         free(game->slidingWindow);
         game->slidingWindow = NULL;
     }
 
-    // Free music
-    if (game->music)
+    if (game->music) {
         Mix_FreeMusic(game->music);
-
-    // Free AI driver array
-    if (game->aiController.drivers) {
-        // free the main array
-        free(game->aiController.drivers);
-        game->aiController.drivers = NULL;
+        game->music = NULL;
     }
-
     if (game->trafficLightSound) {
         Mix_FreeMusic(game->trafficLightSound);
         game->trafficLightSound = NULL;
     }
-
-    if (game->trafficLightAnim.frames) {
-        free(game->trafficLightAnim.frames);
-        game->trafficLightAnim.frames = NULL;
-    }
-    if (game->trafficLightAnim.frameDurations) {
-        free(game->trafficLightAnim.frameDurations);
-        game->trafficLightAnim.frameDurations = NULL;
-    }
-
     if (game->uiNavigationSound) {
         Mix_FreeChunk(game->uiNavigationSound);
         game->uiNavigationSound = NULL;
     }
-
     if (game->victorySound) {
         Mix_FreeChunk(game->victorySound);
         game->victorySound = NULL;
     }
-
     if (game->loseSound) {
         Mix_FreeChunk(game->loseSound);
         game->loseSound = NULL;
-    }
-
-    if (game->leaderboard.entries) {
-        free(game->leaderboard.entries);
-        game->leaderboard.entries = NULL;
-        game->leaderboard.entryCount = 0;
     }
 
     if (game->leaderboard.texture) {
@@ -924,14 +861,12 @@ void cleanupGame(Game* game) {
         game->hudFont = NULL;
     }
 
-    if (game->hudFont) {
-        TTF_CloseFont(game->hudFont);
-        game->hudFont = NULL;
-    }
-
-    // Quit SDL_ttf and SDL_mixer
-    TTF_Quit();
-    Mix_CloseAudio();
+    arena_reset(&game->levelArena);
+    arena_reset(&game->frameArena);
+    SDL_free(game->levelArenaStart);
+    SDL_free(game->frameArenaStart);
+    game->levelArenaStart = NULL;
+    game->frameArenaStart = NULL;
 }
 
 double calculateHorizonY(Game* game) {
@@ -941,405 +876,4 @@ double calculateHorizonY(Game* game) {
     } else {
         return (double)game->height / 2.0;
     }
-}
-
-// Comparison function for sorting leaderboard entries
-int compareLeaderboardEntries(const void* a, const void* b) {
-    const LeaderboardEntry* entryA = (const LeaderboardEntry*)a;
-    const LeaderboardEntry* entryB = (const LeaderboardEntry*)b;
-
-    if (entryA->totalRaceTime < entryB->totalRaceTime) return -1;
-    if (entryA->totalRaceTime > entryB->totalRaceTime) return 1;
-    return 0;
-}
-
-// Generate the leaderboard when race ends
-void generateLeaderboard(Game* game) {
-    // Validate AI Controller State
-    if (!game->aiController.drivers && game->aiController.driverCount != 0) {
-         SDL_Log("Error: AI driver array is NULL but count is %d. Resetting count.", game->aiController.driverCount);
-         game->aiController.driverCount = 0; // Attempt recovery
-    }
-    if (game->aiController.driverCount < 0) {
-        SDL_Log("Error: Negative AI driver count (%d). Resetting count.", game->aiController.driverCount);
-         game->aiController.driverCount = 0; // Attempt recovery
-    }
-
-    SDL_Log("DEBUG PRE-FREE - entries: %p, driverCount: %d", 
-            (void*)game->leaderboard.entries, 
-            game->aiController.driverCount);
-
-    // Free any previous leaderboard entries safely
-    if (game->leaderboard.entries) {
-        free(game->leaderboard.entries);
-        game->leaderboard.entries = NULL; // Nullify pointer after freeing
-    }
-    game->leaderboard.entryCount = 0; // Reset entry count
-
-    int numRacers = 1 + game->aiController.driverCount;
-    // numRacers Validity
-    if (numRacers <= 0) { // Handle integer overflow or negative driverCount case
-         SDL_Log("Error: Calculated numRacers (%d) is invalid. Cannot generate leaderboard.", numRacers);
-         game->leaderboard.isActive = false;
-         return;
-    }
-
-
-    // Allocate and Initialize Leaderboard Memory
-    game->leaderboard.entries = malloc(numRacers * sizeof(LeaderboardEntry));
-    if (!game->leaderboard.entries) {
-        SDL_Log("Failed to allocate memory for %d leaderboard entries.", numRacers);
-        game->leaderboard.isActive = false; // Ensure leaderboard unused
-        return; // Exit if allocation failed
-    }
-    // Initialize allocated memory
-    memset(game->leaderboard.entries, 0, numRacers * sizeof(LeaderboardEntry));
-    game->leaderboard.entryCount = numRacers; // Set the count after successful allocation
-
-    // Determine if the player finished first
-    bool playerFinishedFirst = true;
-    for (int i = 0; i < game->aiController.driverCount; i++) {
-        // Check pointer validity within loop
-        if (!game->aiController.drivers) {
-             SDL_Log("Error: AI drivers became NULL during playerFinishedFirst check.");
-             playerFinishedFirst = false; // Assume player not first if data is bad
-             break;
-        }
-        AIDriver* ai = &game->aiController.drivers[i];
-        // Basic check on AI data used in comparison
-        if (!ai || isnan(ai->totalRaceTime)) {
-             SDL_Log("Warning: Invalid AI data encountered during playerFinishedFirst check for AI %d.", i);
-             continue; // Skip any potentially corrupt AI
-        }
-        if (ai->finished && ai->totalRaceTime < game->totalRaceTime) {
-            playerFinishedFirst = false;
-            break;
-        }
-    }
-
-    // AI Time Estimation block
-    if (playerFinishedFirst) {
-        // Check for drivers pointer validity before loop
-        if (!game->aiController.drivers) {
-            SDL_Log("Error: AI drivers pointer is NULL before estimation loop.");
-        } else {
-            for (int i = 0; i < game->aiController.driverCount; i++) {
-                // Checks for each AI driver
-                if (i >= game->aiController.driverCount) { // Bounds check
-                    SDL_Log("Error: Index i (%d) out of bounds for AI drivers (%d)", i, game->aiController.driverCount);
-                    break; // Stop loop if index is invalid
-                }
-                AIDriver* ai = &game->aiController.drivers[i];
-
-                if (!ai) { // Check individual AI pointer
-                    SDL_Log("Error: AI driver pointer at index %d is NULL during estimation.", i);
-                    continue; // Skip potentially corrupt AI
-                }
-
-                // Skip if AI driver data is invalid/AI hasn't started/finished meaningfully
-                if (ai->finished || ai->z <= 0.0 || isnan(ai->z) || isnan(ai->speed) || isnan(ai->totalRaceTime)) {
-                    SDL_Log("Skipping estimation for AI %d: Finished or Invalid data (z:%.2f, speed:%.2f, time:%.2f)", i, ai->z, ai->speed, ai->totalRaceTime);
-                    // Ensure existing time is sane if finished, otherwise fallback to set value
-                    if(isnan(ai->totalRaceTime) || isinf(ai->totalRaceTime) || ai->totalRaceTime < 0.0) {
-                        ai->totalRaceTime = 99999.0;
-                    }
-                    continue;
-                }
-
-                // Compute and validate remaining distance, ensure valid track length
-                if (isnan(game->road.trackLength) || game->road.trackLength <= 0) {
-                        SDL_Log("Warning: Invalid track length (%.2f) during estimation.", game->road.trackLength);
-                        ai->totalRaceTime = 99999.0; // Assign fallback
-                        continue;
-                }
-                double remainingDistance = game->road.trackLength - ai->z; // remaining distance on current lap
-                if (remainingDistance < 0.0) { // wrap around case
-                    remainingDistance += game->road.trackLength;
-                }
-                // validation for calculated remaining distance
-                if (isnan(remainingDistance) || isinf(remainingDistance) || remainingDistance < 0.0) {
-                    SDL_Log("Skipping AI %d: Invalid remaining distance calculated (%.2f)", i, remainingDistance);
-                    ai->totalRaceTime = 99999.0; // Assign fallback
-                    continue;
-                }
-
-                // Use minimum effective speed
-                double effectiveSpeed = (ai->speed > 0.1 && !isnan(ai->speed) && !isinf(ai->speed)) ? ai->speed : 0.1;
-
-                // Estimate remaining time and check result
-                if (effectiveSpeed <= 0) { // Explicit check for zero/negative speed
-                        SDL_Log("Skipping AI %d: Invalid effective speed (%.2f)", i, effectiveSpeed);
-                        ai->totalRaceTime = 99999.0; // Assign fallback
-                        continue;
-                }
-                double estimatedTimeRemaining = remainingDistance / effectiveSpeed;
-                if (isnan(estimatedTimeRemaining) || isinf(estimatedTimeRemaining) || estimatedTimeRemaining < 0.0) {
-                    SDL_Log("Skipping AI %d: Invalid estimated time (%.2f / %.2f = %.2f)", i, remainingDistance, effectiveSpeed, estimatedTimeRemaining);
-                    ai->totalRaceTime = 99999.0; // Assign fallback
-                    continue;
-                }
-
-                // Apply fudge factor and re-validate
-                float min_fudge = 0.5f;
-                float max_fudge = 0.8f;
-                float random_zero_one = (float)rand() / (float)RAND_MAX;
-                double randomFudgeFactor = min_fudge + random_zero_one * (max_fudge - min_fudge);
-                estimatedTimeRemaining *= randomFudgeFactor;
-                if (isnan(estimatedTimeRemaining) || isinf(estimatedTimeRemaining) || estimatedTimeRemaining < 0.0) {
-                    SDL_Log("Skipping AI %d: Invalid time after fudge factor (%.2f)", i, estimatedTimeRemaining);
-                    ai->totalRaceTime = 99999.0; // Assign fallback
-                    continue;
-                }
-
-                // Add to totalRaceTime and validate again
-                double previousTime = ai->totalRaceTime; // Store previous time for checking
-                ai->totalRaceTime += estimatedTimeRemaining;
-                if (isnan(ai->totalRaceTime) || isinf(ai->totalRaceTime) || ai->totalRaceTime < 0.0) {
-                    SDL_Log("AI %d totalRaceTime became invalid after estimation (%.2f + %.2f = %.2f)! Resetting.", i, previousTime, estimatedTimeRemaining, ai->totalRaceTime);
-                    ai->totalRaceTime = 99999.0; // fallback
-                }
-            }
-        }
-    }
-
-    // Populate entries, checking bounds and pointers
-    if (game->leaderboard.entries) { // Ensure entries pointer is still valid
-
-        // Player entry (index 0)
-        if (game->leaderboard.entryCount > 0) { // Check if space exists
-            game->leaderboard.entries[0].isPlayer = true;
-            game->leaderboard.entries[0].lapsCompleted = game->playerLapsCompleted;
-            // check for potentially invalid game state values
-            if (isnan(game->position) || isnan(game->totalRaceTime) || isinf(game->totalRaceTime) || game->totalRaceTime < 0.0) {
-                SDL_Log("Error: Player position or totalRaceTime is invalid!");
-                game->totalRaceTime = 99999.0; // fallback time
-            }
-            if(isnan(game->road.trackLength) || game->road.trackLength < 0) {
-                SDL_Log("Error: Invalid trackLength for player distance calculation!");
-                game->leaderboard.entries[0].totalDistance = 0; // Fallback distance
-            } else {
-                game->leaderboard.entries[0].totalDistance = game->playerLapsCompleted * game->road.trackLength + game->position;
-            }
-            game->leaderboard.entries[0].totalRaceTime = game->totalRaceTime;
-            strncpy(game->leaderboard.entries[0].name, "Player", 31);
-            game->leaderboard.entries[0].name[31] = '\0'; // Ensure null termination
-        } else {
-            SDL_Log("Error: Not enough space allocated for player leaderboard entry.");
-        }
-
-
-        // AI entries
-        if (game->aiController.drivers) { // Check AI drivers pointer
-            for (int i = 0; i < game->aiController.driverCount; i++) {
-                int entryIndex = i + 1;
-                // Check index validity against allocated count
-                if (entryIndex >= game->leaderboard.entryCount) {
-                    SDL_Log("Error: AI entry index (%d) exceeds allocated size (%d). Skipping.", entryIndex, game->leaderboard.entryCount);
-                    continue; // Prevent writing out of bounds
-                }
-
-                // Check individual AI pointer
-                if (i >= game->aiController.driverCount) { // Bounds check
-                    SDL_Log("Error: Index i (%d) out of bounds for AI drivers (%d) in population loop", i, game->aiController.driverCount);
-                    break;
-                }
-                AIDriver* ai = &game->aiController.drivers[i];
-                if (!ai) {
-                    SDL_Log("Error: AI driver pointer at index %d is NULL during population.", i);
-                    // Fill leaderboard slot with placeholder data
-                    game->leaderboard.entries[entryIndex].totalRaceTime = 99999.0;
-                    strncpy(game->leaderboard.entries[entryIndex].name, "AI Error", 31);
-                    game->leaderboard.entries[entryIndex].name[31] = '\0';
-                    game->leaderboard.entries[entryIndex].isPlayer = false;
-                    continue;
-                }
-
-                game->leaderboard.entries[entryIndex].isPlayer = false;
-                game->leaderboard.entries[entryIndex].lapsCompleted = ai->lapsCompleted;
-                // Check AI data validity before using
-                if (isnan(ai->z) || isnan(ai->totalRaceTime) || isinf(ai->totalRaceTime) || ai->totalRaceTime < 0.0 || isnan(game->road.trackLength) || game->road.trackLength < 0) {
-                    SDL_Log("Warning: Invalid data for AI %d during population (z:%.2f, time:%.2f, track:%.2f). Using fallback time/dist.", i, ai->z, ai->totalRaceTime, game->road.trackLength);
-                    game->leaderboard.entries[entryIndex].totalDistance = ai->lapsCompleted * ((!isnan(game->road.trackLength) && game->road.trackLength > 0) ? game->road.trackLength : 0); // Estimate distance
-                    game->leaderboard.entries[entryIndex].totalRaceTime = 99999.0; // fallback time
-                } else {
-                    game->leaderboard.entries[entryIndex].totalDistance = ai->lapsCompleted * game->road.trackLength + ai->z;
-                    game->leaderboard.entries[entryIndex].totalRaceTime = ai->totalRaceTime;
-                }
-                snprintf(game->leaderboard.entries[entryIndex].name, 32, "AI %d", i+1);
-            }
-        } else {
-            SDL_Log("Error: AI drivers pointer NULL during entry population.");
-            // fill remaining slots with error messages if required
-            for (int i = 0; i < game->aiController.driverCount; ++i) {
-                int entryIndex = i + 1;
-                if (entryIndex < game->leaderboard.entryCount) {
-                        game->leaderboard.entries[entryIndex].totalRaceTime = 99999.0;
-                        strncpy(game->leaderboard.entries[entryIndex].name, "AI Error", 31);
-                        game->leaderboard.entries[entryIndex].name[31] = '\0';
-                        game->leaderboard.entries[entryIndex].isPlayer = false;
-                }
-            }
-        }
-    } else {
-        SDL_Log("Error: Leaderboard entries pointer NULL before population.");
-        return;
-    }
-
-
-    // Sanitize Times Before Sorting
-    if (game->leaderboard.entries) { // Check again before access
-        for (int i = 0; i < game->leaderboard.entryCount; i++) { // Use stored count
-            if (i >= game->leaderboard.entryCount) break; // Extra bounds safety
-            LeaderboardEntry* entry = &game->leaderboard.entries[i];
-            if (isnan(entry->totalRaceTime) || isinf(entry->totalRaceTime) || entry->totalRaceTime < 0.0) {
-                SDL_Log("Sanitizing entry %d: Invalid race time (%.2f). Fixing to fallback.", i, entry->totalRaceTime);
-                entry->totalRaceTime = 99999.0; // fallback
-            }
-            // clamp large times too up to 10 hours
-            else if (entry->totalRaceTime > 36000.0) {
-                SDL_Log("Sanitizing entry %d: Clamping excessive race time (%.2f).", i, entry->totalRaceTime);
-                entry->totalRaceTime = 99999.0;
-            }
-        }
-    }
-
-    // Sort Leaderboard Entries Safely
-    if (game->leaderboard.entryCount > 0 && game->leaderboard.entries != NULL) {
-        qsort(game->leaderboard.entries, game->leaderboard.entryCount, sizeof(LeaderboardEntry), compareLeaderboardEntries);
-    } else {
-        SDL_Log("Warning: Skipping qsort due to entryCount=%d or entries=NULL", game->leaderboard.entryCount);
-    }
-
-    // Create Leaderboard Texture
-    if (game->leaderboard.texture) {
-        SDL_DestroyTexture(game->leaderboard.texture);
-        game->leaderboard.texture = NULL;
-    }
-
-    // Check font validity
-    if (!game->hudFont) {
-        SDL_Log("Error: HUD Font is NULL. Cannot create leaderboard texture.");
-        game->leaderboard.isActive = false;
-        return; // Cannot proceed without font
-    }
-
-    const int padding = 20;
-    const int entryHeight = 30;
-    const int entrySpacing = 5;
-    int texWidth = 400;
-
-    // Calculate height based on num of valid entries
-    int validEntryCount = 0;
-    if (game->leaderboard.entries){
-        for(int i = 0; i < game->leaderboard.entryCount; ++i) {
-            // consistent validity check
-            if (i >= game->leaderboard.entryCount) break; // Bounds check
-            LeaderboardEntry* entry = &game->leaderboard.entries[i];
-            if (!isnan(entry->totalRaceTime) && !isinf(entry->totalRaceTime) && entry->totalRaceTime >= 0.0 && entry->totalRaceTime < 90000.0) { // Check for times within limit
-                validEntryCount++;
-            }
-        }
-    } else {
-        SDL_Log("Error: Leaderboard entries NULL before texture dimension calculation.");
-        return;
-    }
-
-    if (validEntryCount <= 0) {
-        SDL_Log("Warning: No valid leaderboard entries to render texture for.");
-        game->leaderboard.isActive = false;
-        return; // avoid creating empty texture
-    }
-
-    // Calculate height based on valid entries
-    int texHeight = padding * 2 + (entryHeight + entrySpacing) * validEntryCount - entrySpacing; // Subtract last spacing
-
-    // Create surface
-    SDL_Surface* surface = SDL_CreateRGBSurfaceWithFormat(0, texWidth, texHeight, 32, SDL_PIXELFORMAT_RGBA8888);
-    if (!surface) {
-        SDL_Log("Failed to create leaderboard surface (%dx%d): %s", texWidth, texHeight, SDL_GetError());
-        game->leaderboard.isActive = false; // start inactive
-        // free entries
-        if (game->leaderboard.entries) {
-            free(game->leaderboard.entries);
-            game->leaderboard.entries = NULL;
-            game->leaderboard.entryCount = 0;
-        }
-        return; // failure
-    }
-
-    SDL_SetSurfaceBlendMode(surface, SDL_BLENDMODE_BLEND);
-    SDL_FillRect(surface, NULL, SDL_MapRGBA(surface->format, 0, 0, 0, 150));
-
-    SDL_Color textColor = {255, 255, 255, 255};
-    int y = padding;
-    int drawnEntries = 0; // Counter for drawn entries
-
-    if(game->leaderboard.entries){ // Check again before loop
-        for (int i = 0; i < game->leaderboard.entryCount && drawnEntries < validEntryCount; i++) { // Use stored count, limit by validEntryCount
-            LeaderboardEntry* entry = &game->leaderboard.entries[i];
-
-             if (isnan(entry->totalRaceTime) || entry->totalRaceTime < 0.0 || entry->totalRaceTime > 1e7) { // Increased upper bound
-                SDL_Log("Skipping drawing corrupted leaderboard entry %d (time: %f)", i, entry->totalRaceTime);
-                continue; // Skip rendering this entry
-            }
-
-            char posText[16], timeText[32];
-            snprintf(posText, sizeof(posText), "%d", drawnEntries + 1); // Pos based on drawn entries
-            snprintf(timeText, sizeof(timeText), "%.2fs", entry->totalRaceTime);
-
-            // Render Text Surfaces with Checks
-            SDL_Surface* posSurf = TTF_RenderText_Blended(game->hudFont, posText, textColor);
-            SDL_Surface* nameSurf = TTF_RenderText_Blended(game->hudFont, entry->name, textColor);
-            SDL_Surface* timeSurf = TTF_RenderText_Blended(game->hudFont, timeText, textColor);
-
-            if (!posSurf || !nameSurf || !timeSurf) {
-                SDL_Log("Failed to render text for entry %d: %s", i, TTF_GetError());
-                SDL_FreeSurface(posSurf); // Free any that succeeded
-                SDL_FreeSurface(nameSurf);
-                SDL_FreeSurface(timeSurf);
-                continue; // Skip entry if any part failed
-            }
-
-            // Blit Surfaces
-            SDL_Rect posRect = {padding, y, posSurf->w, posSurf->h};
-            SDL_BlitSurface(posSurf, NULL, surface, &posRect);
-
-            SDL_Rect nameRect = {padding + 50, y, nameSurf->w, nameSurf->h};
-            SDL_BlitSurface(nameSurf, NULL, surface, &nameRect);
-
-            SDL_Rect timeRect = {texWidth - padding - timeSurf->w, y, timeSurf->w, timeSurf->h};
-            SDL_BlitSurface(timeSurf, NULL, surface, &timeRect);
-
-            SDL_FreeSurface(posSurf);
-            SDL_FreeSurface(nameSurf);
-            SDL_FreeSurface(timeSurf);
-
-            y += entryHeight + entrySpacing;
-            drawnEntries++; // Increment counter for drawn entries
-        }
-    } else {
-         SDL_Log("Error: Leaderboard entries NULL before rendering loop.");
-    }
-
-    // Create Final Texture
-    if (drawnEntries > 0) { // Only create texture if something drawn successfully
-        game->leaderboard.texture = SDL_CreateTextureFromSurface(game->renderer, surface);
-        if (!game->leaderboard.texture) {
-            SDL_Log("Failed to create leaderboard texture from surface: %s", SDL_GetError());
-            game->leaderboard.isActive = false;
-        } else {
-            SDL_SetTextureBlendMode(game->leaderboard.texture, SDL_BLENDMODE_BLEND);
-             game->leaderboard.rect.x = (game->width - texWidth) / 2;
-             game->leaderboard.rect.y = (game->height - texHeight) / 2; // Use calculated texHeight
-             game->leaderboard.rect.w = texWidth;
-             game->leaderboard.rect.h = texHeight;
-             game->leaderboard.isActive = true;
-             SDL_Log("Leaderboard texture created (%dx%d) with %d valid entries.", texWidth, texHeight, drawnEntries);
-        }
-    } else {
-         SDL_Log("No valid entries were drawn, leaderboard inactive.");
-         game->leaderboard.isActive = false;
-    }
-
-    SDL_FreeSurface(surface); // Free surface regardless
 }

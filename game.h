@@ -11,6 +11,8 @@
 #include "level.h"
 #include "ai.h"
 #include "ui.h"
+#include "mem_arena.h"
+#include "leaderboard.h"
 
 typedef enum {
     RACE_STATE_COUNTDOWN,
@@ -18,26 +20,18 @@ typedef enum {
     RACE_STATE_FINISHED
 } RaceState;
 
-// Leaderboard Entry structure
-typedef struct {
-    char name[32];
-    int lapsCompleted;
-    double totalDistance; // laps * trackLength + current position
-    double totalRaceTime;
-    bool isPlayer;
-} LeaderboardEntry;
-
-// Leaderboard structure
-typedef struct {
-    LeaderboardEntry* entries;
-    int entryCount;
-    SDL_Texture* texture;
-    SDL_Rect rect;
-    bool isActive;
-} Leaderboard;
-
 // Game structure
 typedef struct Game {
+    // Memory - per frame arena
+    Arena frameArena; // per frame arena allocator
+    void *frameArenaStart; // start of the big arena block
+    size_t frameArenaCap; // its capacity
+
+    // perm arena
+    Arena levelArena;
+    void *levelArenaStart;
+    size_t levelArenaCap;
+
     RaceState raceState;      // current race state
     bool movementAllowed;     // player/AI move flag
     
@@ -114,6 +108,7 @@ typedef struct Game {
     // Audio
     Mix_Music* music;           // Background music
     LevelRoadData loadedRoadData;
+    LevelSceneryData loadedScenery;
 
     // AI Opponents
     AIController aiController;
@@ -135,11 +130,10 @@ extern Game game;
 
 // Function declarations
 void resetGameForStart(Game* game);
-void initGame(Game* game, SDL_Renderer* renderer); // Initialize the game
+bool initGame(Game* game, SDL_Renderer* renderer, const char* levelRelPath); /* NULL -> DEFAULT_LEVEL_REL_PATH */
 int handleEvent(Game* game, SDL_Event* event);    // Handle input events
 void updateGame(Game* game, double dt);            // Update game state
 void renderGame(Game* game);                       // Render the game
-void cleanupGame(Game* game);                      // Cleanup resources
+void cleanupGame(Game* game); /* Game-owned GPU/audio/arenas only; not SDL_Quit/TTF_Quit/Mix (see main.c) */
 double calculateHorizonY(Game *game);              // Calculate projected horizon line on screen
-void generateLeaderboard(Game* game);              // Generate the leaderboard for end of game
 #endif // GAME_H

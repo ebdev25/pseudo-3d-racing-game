@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdalign.h>
+#include <string.h>
 
 #define AI_RAM_AGGRESSION_FACTOR 0.5  // lateral aggression
 #define AI_RAM_DISTANCE_THRESHOLD (SEGMENT_LENGTH * 0.75)  // ramming distance
@@ -374,7 +376,7 @@ void initAIController(AIController* ctrl, struct Game* game, int numDrivers)
     ctrl->driverCount = numDrivers;
 
     // Catchup and behavior parameters
-    ctrl->catchupThreshold = 0.4; // Set back to 1.0 if 0.4 too low
+    ctrl->catchupThreshold = 0.1; // how far back ai from player once catchup mechanics start
     ctrl->cornerSpeedFactor = 0.95;
     ctrl->maxAcceleration   = game->accel-200;
     ctrl->maxBraking        = fabs(game->breaking);
@@ -389,7 +391,14 @@ void initAIController(AIController* ctrl, struct Game* game, int numDrivers)
     const int max_row_width = 3;
 
     // Allocate the AI drivers
-    ctrl->drivers = (AIDriver*)calloc(numDrivers, sizeof(AIDriver));
+    size_t total_size = sizeof(AIDriver) * numDrivers;
+    ctrl->drivers = arena_alloc(&game->levelArena, total_size, alignof(AIDriver));
+    if (!ctrl->drivers) {
+        SDL_Log("Error: Allocation for AI Drivers into Level Arena failed.");
+        ctrl->driverCount = 0;
+        return;
+    }
+    memset(ctrl->drivers, 0, total_size);
     for (int i = 0; i < numDrivers; i++) {
         // Staggered position fields
         double assigned_z;
@@ -476,7 +485,7 @@ void updateAIController(AIController* ctrl, double dt)
 
         // Determine catchup speed if AI is too far behind
         if (dist > ctrl->catchupThreshold * trackLength)
-            driver->targetSpeed = game->maxSpeed * 1.5; // 50% faster for catch up
+            driver->targetSpeed = game->maxSpeed * 3.5; // % faster for catch up
         else
             driver->targetSpeed = game->maxSpeed;
 

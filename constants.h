@@ -31,6 +31,9 @@ typedef struct {
 // Sprite structure for texture regions
 typedef struct {
     int x, y, w, h;
+    double collisionOffsetX;
+    double collisionWidth;
+    bool useCustomCollisionBox;
 } Sprite;
 
 typedef struct {
@@ -64,6 +67,9 @@ typedef enum {
 #define CAMERA_HEIGHT 1000
 #define DRAW_DISTANCE 300
 #define FOG_DENSITY 5
+
+/* Level and assets are resolved with paths_resolve() relative to the executable, its parent, or cwd. */
+#define DEFAULT_LEVEL_REL_PATH "levels/beach_test.json"
 #define MAX_CURVATURE 6.0
 
 #define MAX_SPEED (SEGMENT_LENGTH / STEP)
@@ -167,6 +173,5 @@ extern const Sprite SPRITE_LIGHT_FRAME5;
 
 #define BILLBOARD_COUNT 9
 extern const Sprite* SPRITES_BILLBOARDS[BILLBOARD_COUNT];
-Color hexToColor(const char* hexString);
 
 #endif // CONSTANTS_H

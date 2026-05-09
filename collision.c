@@ -8,6 +8,7 @@
 
 // Computes AI scale based on perspective
 static double computeAIScale(Game* game, Segment* aiSegment, double aiZ, double aiOffset) {
+    (void)aiOffset; // Unused parameter
     if (!aiSegment) return 0.0;
 
     double trackLength = game->road.trackLength;
@@ -19,10 +20,6 @@ static double computeAIScale(Game* game, Segment* aiSegment, double aiZ, double 
 
     // If AI behind camera, return 0 scale
     if (aiCameraZ <= 0) return 0.0;
-
-    // Interpolate world Y position for AI
-    double aiWorldY = interpolate(aiSegment->p1.world.y, aiSegment->p2.world.y, percentRemaining(aiZ, SEGMENT_LENGTH));
-    double aiCameraY = aiWorldY + game->cameraDepth;
 
     // Perspective projection scale calculation
     double aiScale = game->cameraDepth / aiCameraZ;
@@ -43,12 +40,23 @@ void checkAIDriverBillboardCollisions(Game* game, AIDriver* driver) {
     // Iterate over all billboard sprites in segment
     for (int n = 0; n < aiSegment->spriteCount; n++) {
         SpriteInstance* sprite = &aiSegment->sprites[n];
-        double spriteW = sprite->source->w * SPRITE_SCALE;
-        // Calculate sprite's center offset
-        double spriteCenterOffset = sprite->offset + ((sprite->offset > 0.0) ? (spriteW / 2.0) : (-spriteW / 2.0));
+
+        // Determine the width of the collision box, using the custom width if specified
+        double spriteW = sprite->source->useCustomCollisionBox ?
+                         sprite->source->collisionWidth * SPRITE_SCALE :
+                         sprite->source->w * SPRITE_SCALE;
+
+        // Determine the offset of the collision box from the sprite's main anchor point
+        double spriteOffsetX = sprite->source->useCustomCollisionBox ?
+                               sprite->source->collisionOffsetX * SPRITE_SCALE :
+                               0.0;
         
+        // BUG FIX: Calculate the CENTER of the sprite's collision box for the overlap check.
+        // The overlap() function requires the center point, not the left edge.
+        double spriteCollisionBoxCenter = sprite->offset + spriteOffsetX;
+
         // Check for overlap between AI's lateral position and sprite's position
-        if (overlap(driver->offset, aiW, spriteCenterOffset, spriteW, 1.0)) {
+        if (overlap(driver->offset, aiW, spriteCollisionBoxCenter, spriteW, 1.0)) {
             // On collision, reduce AI driver's speed and reset its position within segment
             driver->speed = game->maxSpeed / 5.0;
             driver->z = aiSegment->p1.world.z;  // Reset to the start of segment

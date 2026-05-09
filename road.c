@@ -5,6 +5,8 @@
 #include "level.h"
 #include <stdlib.h>
 #include <math.h>
+#include <stdalign.h>
+#include <string.h> // Added for strcmp
 
 // constants for Road
 #define ROAD_LENGTH_NONE   0
@@ -22,6 +24,9 @@
 #define ROAD_CURVE_MEDIUM 4
 #define ROAD_CURVE_HARD   6
 
+#define MAX_SEGMENTS 30000
+#define MAX_SPRITES_PER_SEGMENT 8
+
 // Returns the Y-coordinate of the last segment in the road
 double lastY(Game* game) {
     if (game->road.segmentCount == 0) {
@@ -35,8 +40,11 @@ double lastY(Game* game) {
 void addSegment(Game* game, double curve, double y) {
     int n = game->road.segmentCount;
 
-    // Allocate memory for the new segment in the segments array
-    game->road.segments = realloc(game->road.segments, sizeof(Segment) * (n + 1));
+    // Allocate memory for segments using level arena
+    if (game->road.segmentCount >= MAX_SEGMENTS) {
+        SDL_Log("Error: Segment limit exceeded, increase MAX_SEGMENTS.");
+        return;
+    }
     Segment* segment = &game->road.segments[n];
     segment->index = n;
 
@@ -57,7 +65,7 @@ void addSegment(Game* game, double curve, double y) {
     segment->color = ((n / game->rumbleLength) % 2 == 0) ? COLOR_LIGHT : COLOR_DARK;
 
     // Initialize sprites and cars arrays for this segment
-    segment->sprites = NULL;
+    segment->sprites = arena_alloc(&game->levelArena, sizeof(SpriteInstance) * MAX_SPRITES_PER_SEGMENT, alignof(SpriteInstance));
     segment->spriteCount = 0;
 
     // Increment the total count of road segments
@@ -73,13 +81,13 @@ void addSprite(Game* game, int segmentIndex, const Sprite* sprite, double offset
     // Retrieve the segment at the specified index
     Segment* segment = &game->road.segments[segmentIndex];
 
-    // Allocate memory for a new sprite in the segment's sprites array
-    segment->sprites = realloc(segment->sprites, sizeof(SpriteInstance) * (segment->spriteCount + 1));
-
-    // Initialize the new sprite instance with the provided sprite and offset
-    SpriteInstance* spriteInstance = &segment->sprites[segment->spriteCount];
-    spriteInstance->source = sprite;  // Assign the sprite's texture or image
-    spriteInstance->offset = offset;  // Set the sprite's horizontal offset on the road
+    if (segment->spriteCount >= MAX_SPRITES_PER_SEGMENT) {
+        SDL_Log("Warning: Sprite limit reached for segment %d.", segmentIndex);
+        return;
+    }
+    // assign sprites directly without realloc or malloc
+    segment->sprites[segment->spriteCount].source = sprite;
+    segment->sprites[segment->spriteCount].offset = offset;
 
     // Increment the sprite count for the segment
     segment->spriteCount++;
@@ -183,13 +191,8 @@ void addDownhillToEnd(Game* game, int num) {
 }
 
 void resetRoad(Game* game) {
-    // Free existing segments to reset the road layout
-    for (int i = 0; i < game->road.segmentCount; i++) {
-        free(game->road.segments[i].sprites);  // Free any sprites in each segment
-    }
-    free(game->road.segments);                // Free the segment array
-    game->road.segments = NULL;               // Reset segment pointer to NULL
     game->road.segmentCount = 0;              // Reset the segment count
+    game->road.segments = arena_alloc(&game->levelArena, sizeof(Segment) * MAX_SEGMENTS, alignof(Segment));
     // 2) store the loaded commands in game->loadedRoadData
     LevelRoadData* rd = &game->loadedRoadData;
     // If no commands, fallback to default:
@@ -271,42 +274,82 @@ void resetRoad(Game* game) {
     game->lodCycleThreshold = game->road.trackLength / 3;
 }
 
+/* segment index for single placement; negative counts from end of track */
+static int scenery_resolve_segment_index(int raw, int total) {
+    if (total <= 0) {
+        return 0;
+    }
+    int seg = raw < 0 ? total + raw : raw;
+    if (seg < 0) {
+        seg = 0;
+    }
+    if (seg >= total) {
+        seg = total - 1;
+    }
+    return seg;
+}
+
+/* Exclusive end index for repeat ranges; negative counts from end (e.g. -50 -> total - 50). */
+static int scenery_resolve_exclusive_end(int raw, int total) {
+    if (total <= 0) {
+        return 0;
+    }
+    int e = raw < 0 ? total + raw : raw;
+    if (e < 0) {
+        e = 0;
+    }
+    if (e > total) {
+        e = total;
+    }
+    return e;
+}
+
 void resetSprites(Game* game) {
-    int n, i;
     int totalSegments = game->road.segmentCount;
-
-    // Add billboards to specific points on either side of the track
-    addSprite(game, 240, &SPRITE_BILLBOARD07, -1.2);
-    addSprite(game, 240, &SPRITE_BILLBOARD06, 1.2);
-    addSprite(game, totalSegments - 25, &SPRITE_BILLBOARD07, -1.2);
-    addSprite(game, totalSegments - 25, &SPRITE_BILLBOARD06, 1.2);
-    
-    // Add palm trees at intervals along both sides of the track, starting further down
-    int palmTreeStartSegment = 300;
-    int palmTreeEndSegment = 900;
-    for (n = palmTreeStartSegment; n < palmTreeEndSegment; n += 4 + (int)(n / 100)) {                   
-        // Left Side Palms
-        addSprite(game, n, &SPRITE_PALM_TREE_LEFT, -(1.2 + ((double)rand() / RAND_MAX) * 0.5));  // Near road, left
-        addSprite(game, n, &SPRITE_PALM_TREE_LEFT, -(1.0 + ((double)rand() / RAND_MAX) * 2.0));  // Further away, left
-
-        // Right Side Palms
-        addSprite(game, n, &SPRITE_PALM_TREE_RIGHT, (1.2 + ((double)rand() / RAND_MAX) * 0.5));  // Near road, right
-        addSprite(game, n, &SPRITE_PALM_TREE_RIGHT, (1.0 + ((double)rand() / RAND_MAX) * 2.0));  // Further away, right
+    if (totalSegments <= 0) {
+        return;
     }
 
-    // Randomly add billboards
-    int side;
-    const Sprite* sprite;
-    double offset;
-    double const BILLBOARD_OFFSET = 1.2;
-
-    for (n = 1000; n < (totalSegments - 50); n += 100) {
-        side = rand() % 2 ? 1 : -1; // Randomly choose left or right side of the road
-        int randOffset = rand() % 51; // Random offset for billboard placement within segment range
-        sprite = SPRITES_BILLBOARDS[rand() % BILLBOARD_COUNT]; // Random billboard sprite
-        addSprite(game, n + randOffset, sprite, -side * BILLBOARD_OFFSET); // Add billboard with chosen side and offset
+    for (int i = 0; i < game->loadedScenery.itemCount; i++) {
+        LevelSceneryItem* it = &game->loadedScenery.items[i];
+        if (!it->sprite) {
+            continue;
+        }
+        int seg = scenery_resolve_segment_index(it->segmentIndex, totalSegments);
+        addSprite(game, seg, it->sprite, it->offset);
     }
 
+    for (int r = 0; r < game->loadedScenery.repeatRuleCount; r++) {
+        LevelSceneryRepeatRule* rule = &game->loadedScenery.repeatRules[r];
+        int from = rule->fromSegment < 0 ? totalSegments + rule->fromSegment : rule->fromSegment;
+        int toExc = scenery_resolve_exclusive_end(rule->toSegment, totalSegments);
+        if (from < 0) {
+            from = 0;
+        }
+        if (from >= totalSegments) {
+            from = totalSegments - 1;
+        }
+        if (toExc <= from) {
+            continue;
+        }
+        int step = rule->step > 0 ? rule->step : 1;
+        for (int n = from; n < toExc; n += step) {
+            int seg = n;
+            if (seg < 0) {
+                seg = 0;
+            }
+            if (seg >= totalSegments) {
+                seg = totalSegments - 1;
+            }
+            for (int p = 0; p < rule->placementCount; p++) {
+                const Sprite* spr = rule->placements[p].sprite;
+                if (!spr) {
+                    continue;
+                }
+                addSprite(game, seg, spr, rule->placements[p].offset);
+            }
+        }
+    }
 }
 
  // returns pointer to the segment corresponding to the specified position

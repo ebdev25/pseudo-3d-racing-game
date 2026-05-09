@@ -2,19 +2,248 @@
 #include "level_loader.h"
 #include "background.h"
 #include "constants.h"
+#include "paths.h"
 #include "util.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "cJSON.h"
+#include <stdalign.h>
 
 #include <SDL2/SDL_image.h>
 #include <SDL2/SDL_ttf.h>
 #include <SDL2/SDL_mixer.h>
 
+static const Sprite* resolveScenerySpriteName(const char* name) {
+    if (!name) {
+        return NULL;
+    }
+    if (SDL_strcasecmp(name, "palm_tree_left") == 0) {
+        return &SPRITE_PALM_TREE_LEFT;
+    }
+    if (SDL_strcasecmp(name, "palm_tree_right") == 0) {
+        return &SPRITE_PALM_TREE_RIGHT;
+    }
+    if (SDL_strcasecmp(name, "rock") == 0) {
+        return &SPRITE_ROCK;
+    }
+    if (SDL_strcasecmp(name, "umbrella") == 0) {
+        return &SPRITE_UMBRELLA;
+    }
+    if (SDL_strcasecmp(name, "billboard01") == 0 || SDL_strcasecmp(name, "billboard1") == 0) {
+        return &SPRITE_BILLBOARD01;
+    }
+    if (SDL_strcasecmp(name, "billboard02") == 0 || SDL_strcasecmp(name, "billboard2") == 0) {
+        return &SPRITE_BILLBOARD02;
+    }
+    if (SDL_strcasecmp(name, "billboard03") == 0 || SDL_strcasecmp(name, "billboard3") == 0) {
+        return &SPRITE_BILLBOARD03;
+    }
+    if (SDL_strcasecmp(name, "billboard04") == 0 || SDL_strcasecmp(name, "billboard4") == 0) {
+        return &SPRITE_BILLBOARD04;
+    }
+    if (SDL_strcasecmp(name, "billboard05") == 0 || SDL_strcasecmp(name, "billboard5") == 0) {
+        return &SPRITE_BILLBOARD05;
+    }
+    if (SDL_strcasecmp(name, "billboard06") == 0 || SDL_strcasecmp(name, "billboard6") == 0) {
+        return &SPRITE_BILLBOARD06;
+    }
+    if (SDL_strcasecmp(name, "billboard07") == 0 || SDL_strcasecmp(name, "billboard7") == 0) {
+        return &SPRITE_BILLBOARD07;
+    }
+    if (SDL_strcasecmp(name, "billboard08") == 0 || SDL_strcasecmp(name, "billboard8") == 0) {
+        return &SPRITE_BILLBOARD08;
+    }
+    if (SDL_strcasecmp(name, "billboard09") == 0 || SDL_strcasecmp(name, "billboard9") == 0) {
+        return &SPRITE_BILLBOARD09;
+    }
+    return NULL;
+}
+
+static void clearLoadedScenery(Game* game) {
+    game->loadedScenery.items = NULL;
+    game->loadedScenery.itemCount = 0;
+    game->loadedScenery.repeatRules = NULL;
+    game->loadedScenery.repeatRuleCount = 0;
+}
+
+/*
+ * instances[]: { "sprite": "<id>", "segment": <int>, "offset": <float> }
+ * segment < 0 counts from end of track (e.g. -25 -> segmentCount - 25).
+ */
+static bool parseSceneryInstances(Game* game, cJSON* arr, LevelSceneryItem** outItems, int* outCount) {
+    *outItems = NULL;
+    *outCount = 0;
+    if (!arr || !cJSON_IsArray(arr)) {
+        return true;
+    }
+    int n = cJSON_GetArraySize(arr);
+    if (n <= 0) {
+        return true;
+    }
+    LevelSceneryItem* buf =
+        arena_alloc(&game->levelArena, (size_t)n * sizeof(LevelSceneryItem), alignof(LevelSceneryItem));
+    if (!buf) {
+        SDL_Log("parseSceneryInstances: arena alloc failed");
+        return false;
+    }
+    int w = 0;
+    for (int i = 0; i < n; i++) {
+        cJSON* o = cJSON_GetArrayItem(arr, i);
+        if (!cJSON_IsObject(o)) {
+            continue;
+        }
+        cJSON* sp = cJSON_GetObjectItemCaseSensitive(o, "sprite");
+        if (!cJSON_IsString(sp) || sp->valuestring == NULL) {
+            continue;
+        }
+        const Sprite* spr = resolveScenerySpriteName(sp->valuestring);
+        if (!spr) {
+            SDL_Log("scenery: unknown sprite \"%s\"", sp->valuestring);
+            continue;
+        }
+        cJSON* seg = cJSON_GetObjectItemCaseSensitive(o, "segment");
+        if (!cJSON_IsNumber(seg)) {
+            continue;
+        }
+        cJSON* off = cJSON_GetObjectItemCaseSensitive(o, "offset");
+        double offv = cJSON_IsNumber(off) ? off->valuedouble : 0.0;
+        buf[w].sprite = spr;
+        buf[w].segmentIndex = (int)seg->valuedouble;
+        buf[w].offset = offv;
+        w++;
+    }
+    *outItems = buf;
+    *outCount = w;
+    return true;
+}
+
+/*
+ * repeatAlong[]: { "from": int, "to": int, "step": int, "placements": [ { "sprite", "offset" }, ... ] }
+ * from/to < 0 count from end. "to" is exclusive (segments n with from <= n < to).
+ */
+static bool parseSceneryRepeatAlong(Game* game, cJSON* arr) {
+    if (!arr || !cJSON_IsArray(arr)) {
+        return true;
+    }
+    int n = cJSON_GetArraySize(arr);
+    if (n <= 0) {
+        return true;
+    }
+    LevelSceneryRepeatRule* rules =
+        arena_alloc(&game->levelArena, (size_t)n * sizeof(LevelSceneryRepeatRule), alignof(LevelSceneryRepeatRule));
+    if (!rules) {
+        SDL_Log("parseSceneryRepeatAlong: arena alloc failed");
+        return false;
+    }
+    memset(rules, 0, (size_t)n * sizeof(LevelSceneryRepeatRule));
+    int ruleWrite = 0;
+    for (int i = 0; i < n; i++) {
+        cJSON* o = cJSON_GetArrayItem(arr, i);
+        if (!cJSON_IsObject(o)) {
+            continue;
+        }
+        cJSON* from = cJSON_GetObjectItemCaseSensitive(o, "from");
+        cJSON* to = cJSON_GetObjectItemCaseSensitive(o, "to");
+        cJSON* stepJ = cJSON_GetObjectItemCaseSensitive(o, "step");
+        cJSON* placements = cJSON_GetObjectItemCaseSensitive(o, "placements");
+        if (!cJSON_IsNumber(from) || !cJSON_IsNumber(to) || !cJSON_IsArray(placements)) {
+            continue;
+        }
+        int stepv = cJSON_IsNumber(stepJ) ? (int)stepJ->valuedouble : 1;
+        if (stepv <= 0) {
+            stepv = 1;
+        }
+        int pc = cJSON_GetArraySize(placements);
+        if (pc <= 0) {
+            continue;
+        }
+        LevelSceneryRepeatPlacement* slots = arena_alloc(
+            &game->levelArena, (size_t)pc * sizeof(LevelSceneryRepeatPlacement), alignof(LevelSceneryRepeatPlacement));
+        if (!slots) {
+            SDL_Log("parseSceneryRepeatAlong: placement arena alloc failed");
+            return false;
+        }
+        int pw = 0;
+        for (int p = 0; p < pc; p++) {
+            cJSON* po = cJSON_GetArrayItem(placements, p);
+            if (!cJSON_IsObject(po)) {
+                continue;
+            }
+            cJSON* sp = cJSON_GetObjectItemCaseSensitive(po, "sprite");
+            if (!cJSON_IsString(sp) || sp->valuestring == NULL) {
+                continue;
+            }
+            const Sprite* spr = resolveScenerySpriteName(sp->valuestring);
+            if (!spr) {
+                SDL_Log("scenery repeat: unknown sprite \"%s\"", sp->valuestring);
+                continue;
+            }
+            cJSON* off = cJSON_GetObjectItemCaseSensitive(po, "offset");
+            double offv = cJSON_IsNumber(off) ? off->valuedouble : 0.0;
+            slots[pw].sprite = spr;
+            slots[pw].offset = offv;
+            pw++;
+        }
+        if (pw <= 0) {
+            continue;
+        }
+        rules[ruleWrite].fromSegment = (int)from->valuedouble;
+        rules[ruleWrite].toSegment = (int)to->valuedouble;
+        rules[ruleWrite].step = stepv;
+        rules[ruleWrite].placements = slots;
+        rules[ruleWrite].placementCount = pw;
+        ruleWrite++;
+    }
+    game->loadedScenery.repeatRules = rules;
+    game->loadedScenery.repeatRuleCount = ruleWrite;
+    return true;
+}
+
+/*
+ * "scenery": [ instances... ]  OR  { "instances": [...], "repeatAlong": [...] }
+ */
+static bool loadSceneryFromJson(Game* game, cJSON* sceneryJSON) {
+    clearLoadedScenery(game);
+    if (!sceneryJSON || cJSON_IsNull(sceneryJSON)) {
+        return true;
+    }
+    if (cJSON_IsArray(sceneryJSON)) {
+        return parseSceneryInstances(game, sceneryJSON, &game->loadedScenery.items, &game->loadedScenery.itemCount);
+    }
+    if (!cJSON_IsObject(sceneryJSON)) {
+        SDL_Log("loadSceneryFromJson: ignoring 'scenery' (expected object or array)");
+        clearLoadedScenery(game);
+        return true;
+    }
+    cJSON* inst = cJSON_GetObjectItemCaseSensitive(sceneryJSON, "instances");
+    if (!parseSceneryInstances(game, inst, &game->loadedScenery.items, &game->loadedScenery.itemCount)) {
+        return false;
+    }
+    cJSON* rep = cJSON_GetObjectItemCaseSensitive(sceneryJSON, "repeatAlong");
+    if (!parseSceneryRepeatAlong(game, rep)) {
+        return false;
+    }
+    return true;
+}
+
+// Helper to parse hex colors like "#RRGGBB"
+static Color hexToColor(const char* hexString) {
+    Color color = {0, 0, 0, 255};
+    if (hexString && *hexString == '#') {
+        unsigned int r, g, b;
+        if (sscanf(hexString + 1, "%02x%02x%02x", &r, &g, &b) == 3) {
+            color.r = (Uint8)r;
+            color.g = (Uint8)g;
+            color.b = (Uint8)b;
+        }
+    }
+    return color;
+}
+
 // Function to load background from JSON with thorough debug logs
-bool loadBackground(cJSON* backgroundJSON, LevelBackground* levelBackground) 
+bool loadBackground(Game* game, cJSON* backgroundJSON, LevelBackground* levelBackground) 
 {
     //SDL_Log("loadBackground: Entered function.\n");
 
@@ -43,7 +272,7 @@ bool loadBackground(cJSON* backgroundJSON, LevelBackground* levelBackground)
 
     // Allocate memory for the cycleStates array
     levelBackground->cycleStateCount = cycleStateCount;
-    levelBackground->cycleStates = (BackgroundCycleState*)malloc(sizeof(BackgroundCycleState) * cycleStateCount);
+    levelBackground->cycleStates = arena_alloc(&game->levelArena, sizeof(BackgroundCycleState) * cycleStateCount, alignof(BackgroundCycleState));
     if (!levelBackground->cycleStates) {
         //SDL_Log("loadBackground: Failed to allocate memory for cycleStates.\n");
         return false;
@@ -66,11 +295,11 @@ bool loadBackground(cJSON* backgroundJSON, LevelBackground* levelBackground)
         // 1) Extract 'name'
         cJSON* nameJSON = cJSON_GetObjectItemCaseSensitive(stateJSON, "name");
         if (cJSON_IsString(nameJSON) && (nameJSON->valuestring != NULL)) {
-            state->name = strdup(nameJSON->valuestring);
+            state->name = arena_strdup(&game->levelArena, nameJSON->valuestring);
             //SDL_Log("loadBackground: cycleStates[%d].name = '%s'\n", i, state->name);
         } else {
             //SDL_Log("loadBackground: cycleStates[%d].name is missing or not a valid string.\n", i);
-            state->name = strdup("Unnamed Biome");
+            state->name = arena_strdup(&game->levelArena, "Unnamed Biome");
         }
 
         // 2) Extract 'textureRects'
@@ -279,7 +508,7 @@ bool loadBackground(cJSON* backgroundJSON, LevelBackground* levelBackground)
     return true;
 }
 
-bool loadRoad(cJSON* roadJSON, LevelRoadData* roadData)
+bool loadRoad(Game* game, cJSON* roadJSON, LevelRoadData* roadData)
 {
     if (!cJSON_IsObject(roadJSON)) {
         SDL_Log("loadRoad: 'road' is not an object.\n");
@@ -300,7 +529,7 @@ bool loadRoad(cJSON* roadJSON, LevelRoadData* roadData)
 
     // Allocate memory for the commands
     roadData->commandCount = cmdCount;
-    roadData->commands = (RoadCommand*)malloc(sizeof(RoadCommand) * cmdCount);
+    roadData->commands = arena_alloc(&game->levelArena, sizeof(RoadCommand) * cmdCount, alignof(RoadCommand));
     if (!roadData->commands) {
         SDL_Log("loadRoad: Failed to allocate memory for road commands.\n");
         return false;
@@ -321,10 +550,10 @@ bool loadRoad(cJSON* roadJSON, LevelRoadData* roadData)
         // Read "type"
         cJSON* typeJSON = cJSON_GetObjectItemCaseSensitive(cmdJSON, "type");
         if (cJSON_IsString(typeJSON) && typeJSON->valuestring != NULL) {
-            cmd->type = strdup(typeJSON->valuestring);
+            cmd->type = arena_strdup(&game->levelArena, typeJSON->valuestring);
         } else {
             SDL_Log("loadRoad: commands[%d].type is missing or not a string. Using 'unknown'.\n", i);
-            cmd->type = strdup("unknown");
+            cmd->type = arena_strdup(&game->levelArena, "unknown");
         }
 
         // Read "params" array
@@ -332,17 +561,23 @@ bool loadRoad(cJSON* roadJSON, LevelRoadData* roadData)
         if (cJSON_IsArray(paramsJSON)) {
             int pCount = cJSON_GetArraySize(paramsJSON);
             if (pCount > 0) {
-                cmd->params = (float*)malloc(sizeof(float) * pCount);
-                memset(cmd->params, 0, sizeof(float) * pCount);
-                cmd->paramCount = pCount;
+                cmd->params = arena_alloc(&game->levelArena, sizeof(float) * pCount, alignof(float));
 
-                for (int j = 0; j < pCount; j++) {
-                    cJSON* val = cJSON_GetArrayItem(paramsJSON, j);
-                    if (cJSON_IsNumber(val)) {
-                        cmd->params[j] = (float)val->valuedouble;
-                    } else {
-                        SDL_Log("loadRoad: commands[%d].params[%d] is not a number. Defaulting to 0.\n", i, j);
-                        cmd->params[j] = 0.0f;
+                if (!cmd->params) {
+                    SDL_Log("loadRoad: Failed to allocate params for command %d.\n", i);
+                    cmd->paramCount = 0;
+                } else {
+                    memset(cmd->params, 0, sizeof(float) * pCount);
+                    cmd->paramCount = pCount;
+
+                    for (int j = 0; j < pCount; j++) {
+                        cJSON* val = cJSON_GetArrayItem(paramsJSON, j);
+                        if (cJSON_IsNumber(val)) {
+                            cmd->params[j] = (float)val->valuedouble;
+                        } else {
+                            SDL_Log("loadRoad: commands[%d].params[%d] is not a number. Defaulting to 0.\n", i, j);
+                            cmd->params[j] = 0.0f;
+                        }
                     }
                 }
             }
@@ -358,15 +593,42 @@ bool loadRoad(cJSON* roadJSON, LevelRoadData* roadData)
     return true;
 }
 
+/* Tear down GPU resources and sliding window created during an in-progress loadLevel. */
+static void rollbackLevelLoadGpuResources(Game* game) {
+    game->currentCycleState = NULL;
+    game->targetCycleState = NULL;
+    if (game->slidingWindow) {
+        freeBackgroundResources(game->slidingWindow);
+        free(game->slidingWindow);
+        game->slidingWindow = NULL;
+    }
+    if (game->music) {
+        Mix_FreeMusic(game->music);
+        game->music = NULL;
+    }
+    if (game->spritesheet) {
+        SDL_DestroyTexture(game->spritesheet);
+        game->spritesheet = NULL;
+    }
+    if (game->background) {
+        SDL_DestroyTexture(game->background);
+        game->background = NULL;
+    }
+}
+
 // Function to load a level from a JSON file
 bool loadLevel(Game* game, const char* levelFilePath)
 {
-    //SDL_Log("About to load JSON from path: %s\n", levelFilePath);
+    char resolved_level[1024];
+    if (!paths_resolve(resolved_level, sizeof(resolved_level), levelFilePath)) {
+        SDL_Log("loadLevel: level file not found: %s", levelFilePath);
+        return false;
+    }
 
     // 1. Read the entire file
-    FILE* file = fopen(levelFilePath, "rb");
+    FILE* file = fopen(resolved_level, "rb");
     if (!file) {
-        //SDL_Log("Failed to open level file: %s\n", levelFilePath);
+        SDL_Log("loadLevel: fopen failed: %s", resolved_level);
         return false;
     }
     fseek(file, 0, SEEK_END);
@@ -380,7 +642,7 @@ bool loadLevel(Game* game, const char* levelFilePath)
         return false;
     }
     size_t readSize = fread(fileData, 1, fileSize, file);
-    if (readSize != fileSize) {
+    if (readSize != (size_t)fileSize) {
         //SDL_Log("Failed to read the entire level file.\n");
         free(fileData);
         fclose(file);
@@ -408,7 +670,7 @@ bool loadLevel(Game* game, const char* levelFilePath)
     // 3. Extract levelName
     cJSON* levelName = cJSON_GetObjectItemCaseSensitive(root, "levelName");
     if (cJSON_IsString(levelName) && (levelName->valuestring != NULL)) {
-        level.levelName = strdup(levelName->valuestring);
+        level.levelName = arena_strdup(&game->levelArena, levelName->valuestring);
         //SDL_Log("Level name: %s\n", level.levelName);
     } else {
         //SDL_Log("levelName is missing or not a string.\n");
@@ -425,7 +687,7 @@ bool loadLevel(Game* game, const char* levelFilePath)
 
         // backgroundTexture
         if (cJSON_IsString(bgTexture) && (bgTexture->valuestring != NULL)) {
-            level.resources.backgroundTexture = strdup(bgTexture->valuestring);
+            level.resources.backgroundTexture = arena_strdup(&game->levelArena, bgTexture->valuestring);
             //SDL_Log("level.resources.backgroundTexture: %s\n", level.resources.backgroundTexture);
         } else {
             //SDL_Log("backgroundTexture is missing or not a string.\n");
@@ -435,7 +697,7 @@ bool loadLevel(Game* game, const char* levelFilePath)
 
         // spriteSheet
         if (cJSON_IsString(spriteSheet) && (spriteSheet->valuestring != NULL)) {
-            level.resources.spriteSheet = strdup(spriteSheet->valuestring);
+            level.resources.spriteSheet = arena_strdup(&game->levelArena, spriteSheet->valuestring);
             //SDL_Log("level.resources.spriteSheet: %s\n", level.resources.spriteSheet);
         } else {
             //SDL_Log("spriteSheet is missing or not a string.\n");
@@ -445,7 +707,7 @@ bool loadLevel(Game* game, const char* levelFilePath)
 
         // musicFile
         if (cJSON_IsString(musicFile) && (musicFile->valuestring != NULL)) {
-            level.resources.musicFile = strdup(musicFile->valuestring);
+            level.resources.musicFile = arena_strdup(&game->levelArena, musicFile->valuestring);
             //SDL_Log("level.resources.musicFile: %s\n", level.resources.musicFile);
         } else {
             //SDL_Log("musicFile is missing or not a string.\n");
@@ -490,7 +752,7 @@ bool loadLevel(Game* game, const char* levelFilePath)
 
     // 5. Extract background data and parse it
     cJSON* backgroundJSON = cJSON_GetObjectItemCaseSensitive(root, "background");
-    if (!loadBackground(backgroundJSON, &level.background)) {
+    if (!loadBackground(game, backgroundJSON, &level.background)) {
         //SDL_Log("Failed to load background data.\n");
         cJSON_Delete(root);
         return false;
@@ -499,7 +761,7 @@ bool loadLevel(Game* game, const char* levelFilePath)
     // 6. Road building commands
     cJSON* roadJSON = cJSON_GetObjectItemCaseSensitive(root, "road");
     if (roadJSON) {
-        if (!loadRoad(roadJSON, &level.roadData)) {
+        if (!loadRoad(game, roadJSON, &level.roadData)) {
             SDL_Log("Failed to load road commands.\n");
             cJSON_Delete(root);
             return false;
@@ -514,26 +776,44 @@ bool loadLevel(Game* game, const char* levelFilePath)
     // 7. Game Settings
 
     // 8. Apply loaded data to the game
-    // 8.1 Load background texture
-    game->background = IMG_LoadTexture(game->renderer, level.resources.backgroundTexture);
+    char path_buf[1024];
+
+    if (!paths_resolve(path_buf, sizeof(path_buf), level.resources.backgroundTexture)) {
+        SDL_Log("loadLevel: background texture not found: %s", level.resources.backgroundTexture);
+        cJSON_Delete(root);
+        return false;
+    }
+    game->background = IMG_LoadTexture(game->renderer, path_buf);
     if (!game->background) {
-        //SDL_Log("Failed to load background texture: %s", IMG_GetError());
+        SDL_Log("loadLevel: IMG_LoadTexture background: %s", IMG_GetError());
         cJSON_Delete(root);
         return false;
     }
 
-    // Load Spritesheet
-    game->spritesheet = IMG_LoadTexture(game->renderer, level.resources.spriteSheet);
+    if (!paths_resolve(path_buf, sizeof(path_buf), level.resources.spriteSheet)) {
+        SDL_Log("loadLevel: sprite sheet not found: %s", level.resources.spriteSheet);
+        rollbackLevelLoadGpuResources(game);
+        cJSON_Delete(root);
+        return false;
+    }
+    game->spritesheet = IMG_LoadTexture(game->renderer, path_buf);
     if (!game->spritesheet) {
-        //SDL_Log("Failed to load spritesheet texture: %s", IMG_GetError());
+        SDL_Log("loadLevel: IMG_LoadTexture spritesheet: %s", IMG_GetError());
+        rollbackLevelLoadGpuResources(game);
         cJSON_Delete(root);
         return false;
     }
 
-    // Load Music
-    game->music = Mix_LoadMUS(level.resources.musicFile);
+    if (!paths_resolve(path_buf, sizeof(path_buf), level.resources.musicFile)) {
+        SDL_Log("loadLevel: music not found: %s", level.resources.musicFile);
+        rollbackLevelLoadGpuResources(game);
+        cJSON_Delete(root);
+        return false;
+    }
+    game->music = Mix_LoadMUS(path_buf);
     if (!game->music) {
-        //SDL_Log("Failed to load background music: %s", Mix_GetError());
+        SDL_Log("loadLevel: Mix_LoadMUS: %s", Mix_GetError());
+        rollbackLevelLoadGpuResources(game);
         cJSON_Delete(root);
         return false;
     }
@@ -551,11 +831,14 @@ bool loadLevel(Game* game, const char* levelFilePath)
     // 8.3 Initialize background sliding window
     if (game->slidingWindow) {
         freeBackgroundResources(game->slidingWindow);
+        free(game->slidingWindow);
+        game->slidingWindow = NULL;
     }
 
     game->slidingWindow = (SlidingWindow*)malloc(sizeof(SlidingWindow));
     if (!game->slidingWindow) {
         //SDL_Log("Failed to allocate SlidingWindow.\n");
+        rollbackLevelLoadGpuResources(game);
         cJSON_Delete(root);
         return false;
     }
@@ -595,6 +878,13 @@ bool loadLevel(Game* game, const char* levelFilePath)
         // Only one state available
         game->currentCycleState = &game->slidingWindow->cycleStates[0];
         game->targetCycleState  = NULL;
+    }
+
+    if (!loadSceneryFromJson(game, cJSON_GetObjectItemCaseSensitive(root, "scenery"))) {
+        SDL_Log("loadLevel: scenery allocation failed");
+        rollbackLevelLoadGpuResources(game);
+        cJSON_Delete(root);
+        return false;
     }
 
     cJSON_Delete(root);
